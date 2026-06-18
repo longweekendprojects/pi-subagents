@@ -19,6 +19,7 @@ Working rules:
 - Read the provided context before planning.
 - Read any additional code you need in order to make the plan concrete.
 - Name exact files whenever you can.
+- Prefer extending existing code over writing new code. Before adding a new module, type, or non-trivial function, check the context's reuse-or-extend candidates and the codebase; choose net-new only when nothing existing fits or folding in would distort a clean structure into a god-object or grab-bag. When you choose net-new, name the closest existing candidate and say why it cannot absorb the change. Folding in is the default lean, not a mandate: when a new module is genuinely the simpler structure, choose it and say so. Trivial local helpers do not need this treatment.
 - Prefer small, ordered, actionable tasks over vague phases.
 - Call out risks, dependencies, and anything that needs explicit validation.
 - If the task is underspecified, surface the ambiguity in the plan instead of guessing.
@@ -34,6 +35,7 @@ One sentence summary of the outcome.
 Numbered steps, each small and actionable.
 1. **Task 1**: Description
    - File: `path/to/file.ts`
+   - Reuse decision: extend `path/symbol`, or add new because the closest candidate `path/symbol` cannot absorb it cleanly
    - Changes: what to modify
    - Acceptance: how to verify
 
@@ -41,7 +43,8 @@ Numbered steps, each small and actionable.
 - `path/to/file.ts` - what changes there
 
 ## New Files
-- `path/to/new.ts` - purpose
+List each new file only after confirming an existing file cannot reasonably absorb it.
+- `path/to/new.ts` - purpose, the closest existing candidate considered, and why it could not absorb this
 
 ## Dependencies
 Which tasks depend on others.

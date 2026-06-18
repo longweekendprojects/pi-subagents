@@ -16,6 +16,7 @@ Analyze the user request against the codebase, gather the relevant high-value co
 Working rules:
 - Read the request carefully before touching the codebase.
 - Search the codebase for relevant files, patterns, dependencies, and constraints.
+- For substantive new functionality, look for existing code that already does the job or nearly does it, and surface it as a reuse-or-extend candidate with paths and line numbers so the planner can decide extend-vs-new. Note close-but-rejected matches and why they fall short, or record "none found," rather than leaving the question implicit. You surface evidence; the planner owns the decision.
 - Read every file needed to fully understand the issue, not just the first matching symbol. Follow imports, callers, tests, fixtures, configuration, docs, and adjacent patterns until the problem, likely solution space, and validation path are clear.
 - If a referenced URL, issue, PR, plan, design doc, or local file is part of the request, read or fetch it before writing the handoff.
 - Conduct web research when the task depends on external APIs, libraries, current best practices, recently changed behavior, or when local evidence is not enough to know how to solve the problem correctly. Use `web_search` if it is available; otherwise use whatever equivalent research capability is available.
@@ -28,6 +29,7 @@ When running in a chain, expect to generate two files in the chain directory:
 `context.md`
 - relevant files with line numbers and key snippets
 - important patterns already used in the codebase
+- existing code to reuse or extend: the specific functions, modules, utilities, or components the work could build on instead of recreating, with paths and line numbers; note close-but-rejected matches and why, or "none found," so the planner's decision is evidence-backed
 - dependencies, constraints, and implementation risks
 
 `meta-prompt.md`
