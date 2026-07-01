@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import type { Message } from "@earendil-works/pi-ai";
 
 import {
+	agentCanEditFiles,
 	evaluateCompletionMutationGuard,
 	expectsImplementationMutation,
 	hasMutationToolCall,
@@ -104,4 +105,43 @@ test("implementation task with mutation attempts does not trigger", () => {
 	});
 
 	assert.equal(result.triggered, false);
+});
+
+test("agentCanEditFiles gates on edit/write capability, not bash", () => {
+	// Unrestricted agents inherit the full toolset and can edit.
+	assert.equal(agentCanEditFiles(undefined), true);
+	assert.equal(agentCanEditFiles([]), true);
+	// Read-only reviewers/verifiers/oracle carry bash for inspection but cannot edit.
+	assert.equal(agentCanEditFiles(["read", "grep", "find", "ls", "bash"]), false);
+	assert.equal(agentCanEditFiles(["read", "bash"]), false);
+	assert.equal(agentCanEditFiles(["read", "grep", "find", "ls", "bash", "subagent"]), false);
+	// Agents that declare edit or write can edit.
+	assert.equal(agentCanEditFiles(["read", "edit", "write", "bash"]), true);
+	assert.equal(agentCanEditFiles(["WRITE"]), true);
+});
+
+test("read-only agents are exempt from the completion guard even for implementation-sounding tasks", () => {
+	// Reproduces the reported false positive: oracle, review-verifier, and
+	// wave-review-orchestrator are read-only (no edit/write tool) yet their
+	// tasks describe implementation work they are reviewing.
+	const oracle = evaluateCompletionMutationGuard({
+		agent: "oracle",
+		task: "Recommend how to fix the scheduler concurrency bug and apply the changes",
+		messages: [assistantText("Recommendation: set _DEFAULT_MAX_CONCURRENCY = 1 ...")],
+		tools: ["read", "grep", "find", "ls", "bash"],
+	});
+	assert.equal(oracle.expectedMutation, false);
+	assert.equal(oracle.triggered, false);
+
+	assert.equal(
+		expectsImplementationMutation("review-verifier", "Verify the fix was implemented correctly", ["read", "bash"]),
+		false,
+	);
+	assert.equal(
+		expectsImplementationMutation("wave-review-orchestrator", "Review the wave and fix any real issues", ["read", "grep", "find", "ls", "bash", "subagent"]),
+		false,
+	);
+
+	// A worker with unrestricted tools is still guarded.
+	assert.equal(expectsImplementationMutation("worker", "Implement the approved fix", undefined), true);
 });

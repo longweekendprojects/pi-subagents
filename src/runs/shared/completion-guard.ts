@@ -59,6 +59,28 @@ interface CompletionMutationGuardInput {
 	agent: string;
 	task: string;
 	messages: Message[];
+	/**
+	 * The agent's declared tool set, if it restricts tools. Undefined means the
+	 * agent inherits the full default toolset (which includes edit and write).
+	 */
+	tools?: string[];
+}
+
+const EDIT_TOOL_NAMES = new Set(["edit", "write"]);
+
+/**
+ * Whether an agent can apply file edits at all. An agent can edit only if it
+ * declares an `edit` or `write` tool, or declares no tool restriction (and so
+ * inherits the full default toolset, which includes edit and write).
+ *
+ * Bash deliberately does not count. Read-only reviewers, verifiers, and
+ * advisory agents such as `oracle` routinely carry `bash` for inspection while
+ * being both unable and unexpected to modify files. Counting bash here would
+ * re-introduce the false positive this gate exists to prevent.
+ */
+export function agentCanEditFiles(tools: string[] | undefined): boolean {
+	if (!tools || tools.length === 0) return true;
+	return tools.some((tool) => EDIT_TOOL_NAMES.has(tool.trim().toLowerCase()));
 }
 
 interface CompletionMutationGuardResult {
@@ -83,7 +105,10 @@ function stripScopedNoEditConstraints(task: string): string {
 	return stripped;
 }
 
-export function expectsImplementationMutation(agent: string, task: string): boolean {
+export function expectsImplementationMutation(agent: string, task: string, tools?: string[]): boolean {
+	// An agent without edit/write capability can never "apply changes", so the
+	// completion guard must never fault it for returning without edits.
+	if (!agentCanEditFiles(tools)) return false;
 	const taskText = stripFrameworkInstructions(task);
 	const taskTextWithoutScopedConstraints = stripScopedNoEditConstraints(taskText);
 	if (REVIEW_ONLY_PATTERNS.some((pattern) => pattern.test(taskTextWithoutScopedConstraints))) return false;
@@ -115,7 +140,7 @@ export function hasMutationToolCall(messages: Message[]): boolean {
 }
 
 export function evaluateCompletionMutationGuard(input: CompletionMutationGuardInput): CompletionMutationGuardResult {
-	const expectedMutation = expectsImplementationMutation(input.agent, input.task);
+	const expectedMutation = expectsImplementationMutation(input.agent, input.task, input.tools);
 	const attemptedMutation = hasMutationToolCall(input.messages);
 	return {
 		expectedMutation,
