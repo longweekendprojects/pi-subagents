@@ -135,20 +135,38 @@ describe("mapConcurrent", () => {
 		assert.equal(maxRunning, 1, "should run sequentially with limit=-1");
 	});
 
-	it("does not stagger by default", async () => {
-		const startTimes: number[] = [];
-		const items = [1, 2, 3];
+	it("bounds concurrent launch jitter while preserving ordering and the concurrency limit", async () => {
+		const delays: number[] = [];
+		const started: number[] = [];
+		let running = 0;
+		let maxRunning = 0;
+		const randomValues = [0, 0.5, 1];
 
-		await mapConcurrent(items, 3, async (_item, i) => {
-			startTimes[i] = Date.now();
-			await new Promise((r) => setTimeout(r, 10));
+		const results = await mapConcurrent([1, 2, 3], 3, async (item, index) => {
+			started.push(index);
+			running++;
+			maxRunning = Math.max(maxRunning, running);
+			await Promise.resolve();
+			running--;
+			return item * 2;
+		}, {
+			random: () => randomValues.shift() ?? 0,
+			sleep: async (ms) => { delays.push(ms); },
 		});
 
-		// All workers should start nearly simultaneously
-		const d1 = startTimes[1]! - startTimes[0]!;
-		const d2 = startTimes[2]! - startTimes[0]!;
-		assert.ok(d1 < 20, `worker 1 should start immediately, got ${d1}ms delay`);
-		assert.ok(d2 < 20, `worker 2 should start immediately, got ${d2}ms delay`);
+		assert.deepEqual(delays, [50, 100]);
+		assert.deepEqual(started, [0, 1, 2]);
+		assert.deepEqual(results, [2, 4, 6]);
+		assert.ok(maxRunning <= 3);
+	});
+
+	it("uses exactly zero launch jitter when effective concurrency is one", async () => {
+		const delays: number[] = [];
+		await mapConcurrent([1, 2, 3], 1, async (item) => item, {
+			random: () => 1,
+			sleep: async (ms) => { delays.push(ms); },
+		});
+		assert.deepEqual(delays, []);
 	});
 });
 

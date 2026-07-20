@@ -27,7 +27,7 @@ interface AsyncResultPayload {
 	sessionId?: string;
 	mode?: string;
 	summary?: string;
-	results: Array<{ output?: string; success?: boolean; error?: string; model?: string; attemptedModels?: string[]; modelAttempts?: Array<{ success?: boolean; error?: string }> }>;
+	results: Array<{ output?: string; success?: boolean; error?: string; model?: string; attemptedModels?: string[]; modelAttempts?: Array<{ success?: boolean; error?: string }>; startupRetries?: number }>;
 }
 
 interface AsyncStatusPayload {
@@ -46,6 +46,7 @@ interface AsyncStatusPayload {
 		error?: string;
 		model?: string;
 		thinking?: string;
+		startupRetries?: number;
 		tokens?: { total: number };
 	}>;
 }
@@ -495,6 +496,40 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.ok(statusPayload.steps[0]?.tokens!.total > 0);
 		assert.match(fs.readFileSync(path.join(asyncDir, "output-0.log"), "utf-8"), /Recovered asynchronously/);
 		assert.equal(mockPi.callCount(), 2);
+	});
+
+	it("background runs retry auth-empty startup failures twice before falling back", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		for (let attempt = 0; attempt < 3; attempt++) {
+			mockPi.onCall({ exitCode: 1, stderr: "No API key found for provider" });
+		}
+		mockPi.onCall({ output: "Recovered asynchronously" });
+		const id = `async-startup-auth-${Date.now().toString(36)}`;
+		const asyncDir = path.join(ASYNC_DIR, id);
+		executeAsyncSingle(id, {
+			agent: "worker",
+			task: "Do work",
+			agentConfig: makeAgent("worker", {
+				model: "openai/gpt-5-mini",
+				fallbackModels: ["anthropic/claude-sonnet-4"],
+			}),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			sessionRoot: path.join(tempDir, "sessions"),
+			maxSubagentDepth: 2,
+		});
+
+		const resultPath = await waitForAsyncResultFile(id);
+		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+		const status = JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf-8")) as AsyncStatusPayload;
+		assert.equal(payload.success, true);
+		assert.equal(payload.results[0]?.startupRetries, 2);
+		assert.equal(status.steps?.[0]?.startupRetries, 2);
+		assert.deepEqual(payload.results[0]?.attemptedModels, ["openai/gpt-5-mini", "anthropic/claude-sonnet-4"]);
+		assert.equal(payload.results[0]?.modelAttempts?.length, 4);
+		assert.match(payload.results[0]?.output ?? "", /\[startup retry\]/);
+		assert.match(payload.results[0]?.output ?? "", /\[fallback\]/);
+		assert.equal(mockPi.callCount(), 4);
 	});
 
 	it("background runs fail zero-exit provider errors when no fallback succeeds", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {

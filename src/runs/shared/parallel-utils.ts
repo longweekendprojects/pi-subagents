@@ -44,24 +44,39 @@ export function flattenSteps(steps: RunnerStep[]): RunnerSubagentStep[] {
 	return flat;
 }
 
+export interface ParallelLaunchOptions {
+	random?: () => number;
+	sleep?: (ms: number) => Promise<void>;
+}
+
+export function parallelLaunchJitterMs(effectiveConcurrency: number, random: () => number = Math.random): number {
+	if (effectiveConcurrency <= 1) return 0;
+	return Math.floor(Math.max(0, Math.min(1, random())) * 100);
+}
+
 export async function mapConcurrent<T, R>(
 	items: T[],
 	limit: number,
 	fn: (item: T, i: number) => Promise<R>,
+	options: ParallelLaunchOptions = {},
 ): Promise<R[]> {
 	const safeLimit = Math.max(1, Math.floor(limit) || 1);
+	const effectiveConcurrency = Math.min(safeLimit, items.length);
+	const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
 	const results: R[] = new Array(items.length);
 	let next = 0;
 
 	async function worker(_workerIndex: number): Promise<void> {
 		while (next < items.length) {
 			const i = next++;
+			const jitterMs = parallelLaunchJitterMs(effectiveConcurrency, options.random);
+			if (jitterMs > 0) await sleep(jitterMs);
 			results[i] = await fn(items[i], i);
 		}
 	}
 
 	await Promise.all(
-		Array.from({ length: Math.min(safeLimit, items.length) }, (_, wi) => worker(wi)),
+		Array.from({ length: effectiveConcurrency }, (_, wi) => worker(wi)),
 	);
 	return results;
 }

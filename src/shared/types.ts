@@ -188,6 +188,7 @@ export interface SingleResult {
 	model?: string;
 	attemptedModels?: string[];
 	modelAttempts?: ModelAttempt[];
+	startupRetries?: number;
 	controlEvents?: ControlEvent[];
 	error?: string;
 	sessionFile?: string;
@@ -318,6 +319,7 @@ export interface AsyncStatus {
 		thinking?: string;
 		attemptedModels?: string[];
 		modelAttempts?: ModelAttempt[];
+		startupRetries?: number;
 		error?: string;
 	}>;
 	sessionDir?: string;

@@ -53,6 +53,29 @@ describe("async status helpers", () => {
 		}
 	});
 
+	it("reports startup retries separately from model fallback candidates", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-status-startup-retry-"));
+		try {
+			createAsyncDir(root, "run-retry", {
+				runId: "run-retry",
+				mode: "single",
+				state: "complete",
+				startedAt: 100,
+				steps: [{
+					agent: "worker",
+					status: "complete",
+					model: "anthropic/claude-sonnet-4",
+					attemptedModels: ["openai/gpt-5-mini", "anthropic/claude-sonnet-4"],
+					startupRetries: 2,
+				}],
+			});
+			const text = formatAsyncRunList(listAsyncRuns(root, { states: ["complete"] }));
+			assert.match(text, /2 startup retries/);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("formats model thinking in step summaries", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-status-model-thinking-"));
 		try {

@@ -181,6 +181,28 @@ describe("renderSubagentResult fork indicator", () => {
 		assert.match(text, /⎿  Error: boom/);
 	});
 
+	it("reports startup retries separately from fallback candidates", () => {
+		const widget = renderSubagentResult!({
+			content: [{ type: "text", text: "done" }],
+			details: {
+				mode: "single",
+				results: [{
+					agent: "worker",
+					task: "work",
+					exitCode: 0,
+					messages: [],
+					usage: emptyUsage,
+					startupRetries: 2,
+					attemptedModels: ["openai/gpt-5-mini", "anthropic/claude-sonnet-4"],
+				}],
+			},
+		}, { expanded: true }, theme);
+
+		const text = widget.render(120).join("\n");
+		assert.match(text, /Startup retries: 2/);
+		assert.match(text, /Fallbacks: openai\/gpt-5-mini → anthropic\/claude-sonnet-4/);
+	});
+
 	it("shows live detail hints for running subagents", () => {
 		const now = Date.now();
 		const widget = renderSubagentResult!({

@@ -11,6 +11,25 @@ interface ModelAttemptSummary {
 	usage?: Usage;
 }
 
+export interface StartupAttemptEvidence {
+	exitCode?: number | null;
+	error?: string;
+	sawAgentStart: boolean;
+	sawMessageStart: boolean;
+}
+
+export const MAX_STARTUP_AUTH_RETRIES = 2;
+const STARTUP_RETRY_BASE_DELAY_MS = 100;
+const STARTUP_RETRY_MAX_DELAY_MS = 1_000;
+const STARTUP_RETRY_JITTER_MS = 100;
+
+const STARTUP_AUTH_UNAVAILABLE_PATTERNS = [
+	/no api key found/i,
+	/no api key (?:is )?(?:available|configured)/i,
+	/no authentication token found/i,
+	/no credentials? found/i,
+];
+
 export function splitThinkingSuffix(model: string): { baseModel: string; thinkingSuffix: string } {
 	const colonIdx = model.lastIndexOf(":");
 	if (colonIdx === -1) return { baseModel: model, thinkingSuffix: "" };
@@ -93,6 +112,27 @@ const RETRYABLE_MODEL_FAILURE_PATTERNS = [
 export function isRetryableModelFailure(error: string | undefined): boolean {
 	if (!error) return false;
 	return RETRYABLE_MODEL_FAILURE_PATTERNS.some((pattern) => pattern.test(error));
+}
+
+export function isStartupAuthUnavailableFailure(evidence: StartupAttemptEvidence): boolean {
+	return evidence.exitCode !== undefined
+		&& evidence.exitCode !== null
+		&& evidence.exitCode !== 0
+		&& !evidence.sawAgentStart
+		&& !evidence.sawMessageStart
+		&& Boolean(evidence.error)
+		&& STARTUP_AUTH_UNAVAILABLE_PATTERNS.some((pattern) => pattern.test(evidence.error!));
+}
+
+export function startupRetryDelayMs(retryIndex: number, random: () => number = Math.random): number {
+	const exponentialDelay = Math.min(STARTUP_RETRY_MAX_DELAY_MS, STARTUP_RETRY_BASE_DELAY_MS * 2 ** retryIndex);
+	const jitter = Math.floor(Math.max(0, Math.min(1, random())) * (STARTUP_RETRY_JITTER_MS + 1));
+	return Math.min(STARTUP_RETRY_MAX_DELAY_MS, exponentialDelay + jitter);
+}
+
+export function formatStartupRetryNote(attempt: ModelAttemptSummary, delayMs: number): string {
+	const failure = attempt.error?.trim() || `exit ${attempt.exitCode ?? 1}`;
+	return `[startup retry] ${attempt.model} could not start: ${failure}. Retrying the same model in ${delayMs}ms.`;
 }
 
 export function formatModelAttemptNote(attempt: ModelAttemptSummary, nextModel?: string): string {

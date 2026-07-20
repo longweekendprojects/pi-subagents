@@ -80,6 +80,7 @@ interface ResultChildOutcome {
 	model?: string;
 	attemptedModels?: string[];
 	modelAttempts?: NonNullable<AsyncStatus["steps"]>[number]["modelAttempts"];
+	startupRetries?: number;
 }
 
 interface ResultRepairData {
@@ -98,6 +99,10 @@ function readResultRepairData(resultPath: string): ResultRepairData | undefined 
 			cause: error instanceof Error ? error : undefined,
 		});
 	}
+}
+
+function existingSessionFile(sessionFile: string | undefined): string | undefined {
+	return sessionFile && fs.existsSync(sessionFile) ? sessionFile : undefined;
 }
 
 function childState(overallState: ResultRepairData["state"], child: ResultChildOutcome | undefined): "complete" | "failed" | "paused" {
@@ -120,10 +125,11 @@ function terminalStatusFromResult(status: AsyncStatus, resultPath: string, now: 
 			durationMs: step.startedAt !== undefined && step.durationMs === undefined ? Math.max(0, now - step.startedAt) : step.durationMs,
 			exitCode: step.exitCode ?? (state === "complete" || state === "paused" ? 0 : 1),
 			error: state === "failed" ? step.error ?? child?.error : step.error,
-			sessionFile: step.sessionFile ?? child?.sessionFile,
+			sessionFile: existingSessionFile(step.sessionFile) ?? existingSessionFile(child?.sessionFile),
 			model: step.model ?? child?.model,
 			attemptedModels: step.attemptedModels ?? child?.attemptedModels,
 			modelAttempts: step.modelAttempts ?? child?.modelAttempts,
+			startupRetries: step.startupRetries ?? child?.startupRetries,
 		};
 	});
 	return {
@@ -171,6 +177,7 @@ function buildFailedRepair(status: AsyncStatus, asyncDir: string, now: number, r
 	const repairedSteps = steps.map((step) => step.status === "running" || step.status === "pending"
 		? {
 			...step,
+			sessionFile: existingSessionFile(step.sessionFile),
 			status: "failed" as const,
 			activityState: undefined,
 			endedAt: step.endedAt ?? now,
@@ -178,7 +185,7 @@ function buildFailedRepair(status: AsyncStatus, asyncDir: string, now: number, r
 			exitCode: step.exitCode ?? 1,
 			error: step.error ?? message,
 		}
-		: step);
+		: { ...step, sessionFile: existingSessionFile(step.sessionFile) });
 	const repairedStatus: AsyncStatus = {
 		...status,
 		state: "failed",
@@ -206,14 +213,15 @@ function buildFailedRepair(status: AsyncStatus, asyncDir: string, now: number, r
 				model: step.model,
 				attemptedModels: step.attemptedModels,
 				modelAttempts: step.modelAttempts,
-				sessionFile: step.sessionFile,
+				startupRetries: step.startupRetries,
+				sessionFile: existingSessionFile(step.sessionFile),
 			})),
 			exitCode: 1,
 			timestamp: now,
 			durationMs: Math.max(0, now - status.startedAt),
 			asyncDir,
 			sessionId: status.sessionId,
-			sessionFile: status.sessionFile,
+			sessionFile: existingSessionFile(status.sessionFile),
 		},
 	};
 }

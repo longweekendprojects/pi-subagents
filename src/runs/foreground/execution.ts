@@ -50,7 +50,11 @@ import { captureSingleOutputSnapshot, formatSavedOutputReference, resolveSingleO
 import {
 	buildModelCandidates,
 	formatModelAttemptNote,
+	formatStartupRetryNote,
 	isRetryableModelFailure,
+	isStartupAuthUnavailableFailure,
+	MAX_STARTUP_AUTH_RETRIES,
+	startupRetryDelayMs,
 } from "../shared/model-fallback.ts";
 import {
 	createMutatingFailureState,
@@ -103,6 +107,7 @@ function snapshotResult(result: SingleResult, progress: AgentProgress): SingleRe
 		usage: { ...result.usage },
 		skills: result.skills ? [...result.skills] : undefined,
 		attemptedModels: result.attemptedModels ? [...result.attemptedModels] : undefined,
+		startupRetries: result.startupRetries,
 		modelAttempts: result.modelAttempts
 			? result.modelAttempts.map((attempt) => ({
 				...attempt,
@@ -116,6 +121,18 @@ function snapshotResult(result: SingleResult, progress: AgentProgress): SingleRe
 		truncation: result.truncation ? { ...result.truncation } : undefined,
 		outputReference: result.outputReference ? { ...result.outputReference } : undefined,
 	};
+}
+
+interface SingleAttemptResult extends SingleResult {
+	startupEvidence: {
+		sawAgentStart: boolean;
+		sawMessageStart: boolean;
+		text: string;
+	};
+}
+
+function waitForStartupRetry(delayMs: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, delayMs));
 }
 
 async function runSingleAttempt(
@@ -134,7 +151,7 @@ async function runSingleAttempt(
 		attemptNotes: string[];
 		outputSnapshot?: SingleOutputSnapshot;
 	},
-): Promise<SingleResult> {
+): Promise<SingleAttemptResult> {
 	const modelArg = applyThinkingSuffix(model, agent.thinking);
 	const { args, env: sharedEnv, tempDir } = buildPiArgs({
 		baseArgs: ["--mode", "json", "-p"],
@@ -200,6 +217,7 @@ async function runSingleAttempt(
 	result.progress = progress;
 	const spawnEnv = { ...process.env, ...sharedEnv, ...getSubagentDepthEnv(options.maxSubagentDepth) };
 	let observedMutationAttempt = false;
+	const startupEvidence = { sawAgentStart: false, sawMessageStart: false, text: "" };
 
 	const exitCode = await new Promise<number>((resolve) => {
 		const spawnSpec = getPiSpawnCommand(args);
@@ -408,11 +426,14 @@ async function runSingleAttempt(
 			try {
 				evt = JSON.parse(line) as { type?: string; message?: Message; toolName?: string; args?: unknown };
 			} catch {
-				// Non-JSON stdout lines are expected; only structured events are parsed.
+				// Non-JSON stdout lines are expected; retain them only for startup failure classification.
+				startupEvidence.text += `${line}\n`;
 				return;
 			}
 
 			const now = Date.now();
+			if (evt.type === "agent_start") startupEvidence.sawAgentStart = true;
+			if (evt.type === "message_start") startupEvidence.sawMessageStart = true;
 			progress.durationMs = now - startTime;
 			progress.lastActivityAt = now;
 			updateActivityState(now);
@@ -625,14 +646,17 @@ async function runSingleAttempt(
 			tokens: progress.tokens,
 			durationMs: progress.durationMs,
 		};
-		return result;
+		return Object.assign(result, { startupEvidence });
 	}
 	if (result.detached) {
 		result.exitCode = 0;
 		result.finalOutput = "Detached for intercom coordination.";
-		return result;
+		return Object.assign(result, { startupEvidence });
 	}
 
+	if (!result.error && result.exitCode !== 0 && startupEvidence.text.trim()) {
+		result.error = startupEvidence.text.trim();
+	}
 	if (result.error && result.exitCode === 0) {
 		result.exitCode = 1;
 	}
@@ -710,7 +734,7 @@ async function runSingleAttempt(
 			},
 		});
 	}
-	return result;
+	return Object.assign(result, { startupEvidence });
 }
 
 /**
@@ -795,40 +819,56 @@ export async function runSync(
 	}
 
 	let lastResult: SingleResult | undefined;
+	let startupRetries = 0;
 	const modelsToTry = candidates.length > 0 ? candidates : [undefined];
 	for (let i = 0; i < modelsToTry.length; i++) {
 		const candidate = modelsToTry[i];
 		if (candidate) attemptedModels.push(candidate);
-		const outputSnapshot = captureSingleOutputSnapshot(options.outputPath);
-		const result = await runSingleAttempt(runtimeCwd, agent, task, candidate, options, {
-			sessionEnabled,
-			systemPrompt,
-			resolvedSkillNames: resolvedSkills.length > 0 ? resolvedSkills.map((skill) => skill.name) : undefined,
-			skillsWarning: missingSkills.length > 0 ? `Skills not found: ${missingSkills.join(", ")}` : undefined,
-			jsonlPath,
-			artifactPaths: artifactPathsResult,
-			attemptNotes,
-			outputSnapshot,
-		});
-		lastResult = result;
-		sumUsage(aggregateUsage, result.usage);
-		totalToolCount += result.progressSummary?.toolCount ?? 0;
-		totalDurationMs += result.progressSummary?.durationMs ?? 0;
-		const attemptSucceeded = result.exitCode === 0 && !result.error;
-		const attempt: ModelAttempt = {
-			model: candidate ?? result.model ?? agent.model ?? "default",
-			success: attemptSucceeded,
-			exitCode: result.exitCode,
-			error: result.error,
-			usage: { ...result.usage },
-		};
-		modelAttempts.push(attempt);
-		if (attemptSucceeded) {
-			break;
-		}
-		if (!isRetryableModelFailure(result.error) || i === modelsToTry.length - 1) {
-			break;
-		}
+		let candidateStartupRetries = 0;
+		let attemptSucceeded = false;
+		let attempt: ModelAttempt | undefined;
+		do {
+			const outputSnapshot = captureSingleOutputSnapshot(options.outputPath);
+			const result = await runSingleAttempt(runtimeCwd, agent, task, candidate, options, {
+				sessionEnabled,
+				systemPrompt,
+				resolvedSkillNames: resolvedSkills.length > 0 ? resolvedSkills.map((skill) => skill.name) : undefined,
+				skillsWarning: missingSkills.length > 0 ? `Skills not found: ${missingSkills.join(", ")}` : undefined,
+				jsonlPath,
+				artifactPaths: artifactPathsResult,
+				attemptNotes,
+				outputSnapshot,
+			});
+			lastResult = result;
+			sumUsage(aggregateUsage, result.usage);
+			totalToolCount += result.progressSummary?.toolCount ?? 0;
+			totalDurationMs += result.progressSummary?.durationMs ?? 0;
+			attemptSucceeded = result.exitCode === 0 && !result.error;
+			attempt = {
+				model: candidate ?? result.model ?? agent.model ?? "default",
+				success: attemptSucceeded,
+				exitCode: result.exitCode,
+				error: result.error,
+				usage: { ...result.usage },
+			};
+			modelAttempts.push(attempt);
+			if (attemptSucceeded || !isStartupAuthUnavailableFailure({
+				exitCode: result.exitCode,
+				error: `${result.error ?? ""}\n${result.startupEvidence.text}`,
+				sawAgentStart: result.startupEvidence.sawAgentStart,
+				sawMessageStart: result.startupEvidence.sawMessageStart,
+			}) || candidateStartupRetries >= MAX_STARTUP_AUTH_RETRIES) {
+				break;
+			}
+			const delayMs = startupRetryDelayMs(candidateStartupRetries);
+			candidateStartupRetries++;
+			startupRetries++;
+			totalDurationMs += delayMs;
+			attemptNotes.push(formatStartupRetryNote(attempt, delayMs));
+			await waitForStartupRetry(delayMs);
+		} while (true);
+		if (attemptSucceeded) break;
+		if (!attempt || !isRetryableModelFailure(attempt.error) || i === modelsToTry.length - 1) break;
 		attemptNotes.push(formatModelAttemptNote(attempt, modelsToTry[i + 1]));
 	}
 
@@ -844,11 +884,17 @@ export async function runSync(
 	result.usage = aggregateUsage;
 	result.attemptedModels = attemptedModels.length > 0 ? attemptedModels : undefined;
 	result.modelAttempts = modelAttempts.length > 0 ? modelAttempts : undefined;
+	result.startupRetries = startupRetries || undefined;
 	result.progressSummary = {
 		toolCount: totalToolCount,
 		tokens: aggregateUsage.input + aggregateUsage.output,
 		durationMs: totalDurationMs,
 	};
+	if (result.progress) {
+		result.progress.toolCount = totalToolCount;
+		result.progress.tokens = aggregateUsage.input + aggregateUsage.output;
+		result.progress.durationMs = totalDurationMs;
+	}
 	if (attemptNotes.length > 0 && result.progress) {
 		result.progress.recentOutput = [...attemptNotes, ...result.progress.recentOutput];
 		if (result.progress.recentOutput.length > 50) {
@@ -871,6 +917,7 @@ export async function runSync(
 				model: result.model,
 				attemptedModels: result.attemptedModels,
 				modelAttempts: result.modelAttempts,
+				startupRetries: result.startupRetries,
 				durationMs: result.progressSummary?.durationMs,
 				toolCount: result.progressSummary?.toolCount,
 				error: result.error,
@@ -891,7 +938,7 @@ export async function runSync(
 		if (truncationResult.truncated) result.truncation = truncationResult;
 	}
 
-	if (options.sessionFile && (existsSync(options.sessionFile) || result.messages?.length)) {
+	if (options.sessionFile && existsSync(options.sessionFile)) {
 		result.sessionFile = options.sessionFile;
 	} else if (shareEnabled && options.sessionDir) {
 		const sessionFile = findLatestSessionFile(options.sessionDir);

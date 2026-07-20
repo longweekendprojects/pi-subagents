@@ -12,8 +12,11 @@
 ## [Unreleased]
 
 ### Added
+- Stagger concurrent subagent launches by up to 100ms to reduce simultaneous startup authentication failures without delaying serial work.
 
 ### Fixed
+- Retry auth-unavailable child startups on the same model before moving to configured fallback models, and report startup retries separately from model fallback.
+- Report child session files only after they are present on disk.
 
 ## [0.24.2] - 2026-05-10
 

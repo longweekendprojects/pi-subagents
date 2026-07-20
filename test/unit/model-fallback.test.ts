@@ -3,7 +3,9 @@ import { describe, it } from "node:test";
 import {
 	buildModelCandidates,
 	isRetryableModelFailure,
+	isStartupAuthUnavailableFailure,
 	resolveModelCandidate,
+	startupRetryDelayMs,
 } from "../../src/runs/shared/model-fallback.ts";
 
 describe("model fallback helpers", () => {
@@ -72,5 +74,38 @@ describe("model fallback helpers", () => {
 		assert.equal(isRetryableModelFailure("bash failed (exit 1): command not found"), false);
 		assert.equal(isRetryableModelFailure("read failed (exit 1): no such file or directory"), false);
 		assert.equal(isRetryableModelFailure(undefined), false);
+	});
+
+	it("classifies only auth-empty startup failures for same-model retries", () => {
+		assert.equal(isStartupAuthUnavailableFailure({
+			exitCode: 1,
+			error: "No API key found for provider",
+			sawAgentStart: false,
+			sawMessageStart: false,
+		}), true);
+		assert.equal(isStartupAuthUnavailableFailure({
+			exitCode: 0,
+			error: "No API key found for provider",
+			sawAgentStart: false,
+			sawMessageStart: false,
+		}), false);
+		assert.equal(isStartupAuthUnavailableFailure({
+			exitCode: 1,
+			error: "No API key found for provider",
+			sawAgentStart: true,
+			sawMessageStart: false,
+		}), false);
+		assert.equal(isStartupAuthUnavailableFailure({
+			exitCode: 1,
+			error: "invalid API key",
+			sawAgentStart: false,
+			sawMessageStart: false,
+		}), false);
+	});
+
+	it("uses capped exponential startup retry timing with deterministic jitter", () => {
+		assert.equal(startupRetryDelayMs(0, () => 0), 100);
+		assert.equal(startupRetryDelayMs(1, () => 0.5), 250);
+		assert.equal(startupRetryDelayMs(20, () => 1), 1000);
 	});
 });

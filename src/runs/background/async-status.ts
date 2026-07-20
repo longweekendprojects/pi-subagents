@@ -27,6 +27,7 @@ interface AsyncRunStepSummary {
 	model?: string;
 	thinking?: string;
 	attemptedModels?: string[];
+	startupRetries?: number;
 	error?: string;
 }
 
@@ -88,6 +89,10 @@ function isAsyncRunDir(root: string, entry: string): boolean {
 			cause: error instanceof Error ? error : undefined,
 		});
 	}
+}
+
+function existingSessionFile(sessionFile: string | undefined): string | undefined {
+	return sessionFile && fs.existsSync(sessionFile) ? sessionFile : undefined;
 }
 
 function outputFileMtime(outputFile: string | undefined): number | undefined {
@@ -163,13 +168,14 @@ function statusToSummary(asyncDir: string, status: AsyncStatus & { cwd?: string 
 				...(step.model ? { model: step.model } : {}),
 				...(step.thinking ? { thinking: step.thinking } : {}),
 				...(step.attemptedModels ? { attemptedModels: step.attemptedModels } : {}),
+				...(step.startupRetries ? { startupRetries: step.startupRetries } : {}),
 				...(step.error ? { error: step.error } : {}),
 			};
 		}),
 		...(status.sessionDir ? { sessionDir: status.sessionDir } : {}),
 		...(status.outputFile ? { outputFile: status.outputFile } : {}),
 		...(status.totalTokens ? { totalTokens: status.totalTokens } : {}),
-		...(status.sessionFile ? { sessionFile: status.sessionFile } : {}),
+		...(existingSessionFile(status.sessionFile) ? { sessionFile: status.sessionFile } : {}),
 	};
 }
 
@@ -240,6 +246,7 @@ function formatStepLine(step: AsyncRunStepSummary): string {
 	const modelThinking = formatModelThinking(step.model, step.thinking);
 	if (modelThinking) parts.push(modelThinking);
 	if (step.durationMs !== undefined) parts.push(formatDuration(step.durationMs));
+	if (step.startupRetries) parts.push(`${step.startupRetries} startup ${step.startupRetries === 1 ? "retry" : "retries"}`);
 	if (step.tokens) parts.push(`${formatTokens(step.tokens.total)} tok`);
 	return parts.join(" | ");
 }

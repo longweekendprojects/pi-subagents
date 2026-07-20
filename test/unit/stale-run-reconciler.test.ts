@@ -91,6 +91,8 @@ describe("async stale-run reconciliation", () => {
 			});
 			const scoutSession = path.join(root, "scout.jsonl");
 			const workerSession = path.join(root, "worker.jsonl");
+			fs.writeFileSync(scoutSession, "{}\n", "utf-8");
+			fs.writeFileSync(workerSession, "{}\n", "utf-8");
 			fs.writeFileSync(path.join(resultsDir, "run-mixed.json"), JSON.stringify({
 				id: "run-mixed",
 				success: false,
@@ -118,6 +120,34 @@ describe("async stale-run reconciliation", () => {
 			assert.equal(result.status?.steps?.[1]?.error, "boom");
 			assert.equal(result.status?.steps?.[1]?.model, "careful");
 			assert.equal(result.status?.steps?.[1]?.sessionFile, workerSession);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("does not restore missing session files while repairing stale results", () => {
+		const root = tempRoot("pi-stale-missing-session-");
+		try {
+			const asyncDir = path.join(root, "run-missing-session");
+			const resultsDir = path.join(root, "results");
+			fs.mkdirSync(resultsDir, { recursive: true });
+			writeStatus(asyncDir, {
+				runId: "run-missing-session",
+				mode: "single",
+				state: "running",
+				pid: 12345,
+				startedAt: 1000,
+				lastUpdate: 1000,
+				steps: [{ agent: "worker", status: "running", startedAt: 1000 }],
+			});
+			fs.writeFileSync(path.join(resultsDir, "run-missing-session.json"), JSON.stringify({
+				id: "run-missing-session",
+				success: true,
+				results: [{ agent: "worker", success: true, sessionFile: path.join(root, "missing.jsonl") }],
+			}), "utf-8");
+
+			const result = reconcileAsyncRun(asyncDir, { resultsDir, now: () => 2000 });
+			assert.equal(result.status?.steps?.[0]?.sessionFile, undefined);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}

@@ -62,6 +62,7 @@ interface RunSyncResult {
 	skillsWarning?: string;
 	attemptedModels?: string[];
 	modelAttempts?: ModelAttempt[];
+	startupRetries?: number;
 	usage: { turns: number; input: number; output: number };
 	progress: ProgressSummary;
 	controlEvents?: Array<{ type?: string; message: string; reason?: string; turns?: number; tokens?: number; currentPath?: string; recentFailureSummary?: string }>;
@@ -418,6 +419,70 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(result.modelAttempts?.[1]?.success, true);
 		assert.equal(result.usage.turns, 2);
 		assert.equal(mockPi.callCount(), 2);
+	});
+
+	it("retries auth-empty startup failures twice before falling back", async () => {
+		for (let attempt = 0; attempt < 3; attempt++) {
+			mockPi.onCall({ exitCode: 1, stderr: "No API key found for provider" });
+		}
+		mockPi.onCall({ output: "Recovered on fallback" });
+		const agents = [makeAgent("echo", {
+			model: "openai/gpt-5-mini",
+			fallbackModels: ["anthropic/claude-sonnet-4"],
+		})];
+
+		const result = await runSync(tempDir, agents, "echo", "Task", { runId: "startup-auth-retry-sync" });
+
+		assert.equal(result.exitCode, 0);
+		assert.equal(result.startupRetries, 2);
+		assert.equal(mockPi.callCount(), 4);
+		assert.deepEqual(result.attemptedModels, ["openai/gpt-5-mini", "anthropic/claude-sonnet-4"]);
+		assert.deepEqual(result.modelAttempts?.map((attempt) => attempt.model), [
+			"openai/gpt-5-mini", "openai/gpt-5-mini", "openai/gpt-5-mini", "anthropic/claude-sonnet-4",
+		]);
+		assert.match(result.progress.recentOutput.join("\n"), /\[startup retry\]/);
+		assert.match(result.progress.recentOutput.join("\n"), /\[fallback\]/);
+	});
+
+	it("baselines output files for each startup retry before using a fallback", async () => {
+		const outputPath = path.join(tempDir, "startup-retry-output.md");
+		mockPi.onCall({ exitCode: 1, stderr: "No API key found for provider", delay: 100 });
+		mockPi.onCall({ exitCode: 1, stderr: "No API key found for provider" });
+		mockPi.onCall({ exitCode: 1, stderr: "No API key found for provider" });
+		mockPi.onCall({ output: "fallback output" });
+		const agents = [makeAgent("echo", {
+			model: "openai/gpt-5-mini",
+			fallbackModels: ["anthropic/claude-sonnet-4"],
+		})];
+
+		const run = runSync(tempDir, agents, "echo", "Task", { runId: "startup-auth-output-baseline", outputPath });
+		setTimeout(() => fs.writeFileSync(outputPath, "stale startup output", "utf-8"), 20);
+		const result = await run;
+
+		assert.equal(result.exitCode, 0);
+		assert.equal(fs.readFileSync(outputPath, "utf-8"), "fallback output");
+	});
+
+	it("does not retry the same model after startup activity", async () => {
+		mockPi.onCall({
+			jsonl: [{ type: "agent_start" }],
+			exitCode: 1,
+			stderr: "No API key found for provider",
+		});
+		mockPi.onCall({ output: "Recovered on fallback" });
+		const agents = [makeAgent("echo", {
+			model: "openai/gpt-5-mini",
+			fallbackModels: ["anthropic/claude-sonnet-4"],
+		})];
+
+		const result = await runSync(tempDir, agents, "echo", "Task", { runId: "startup-auth-activity-exclusion" });
+
+		assert.equal(result.exitCode, 0);
+		assert.equal(result.startupRetries, undefined);
+		assert.equal(mockPi.callCount(), 2);
+		assert.deepEqual(result.modelAttempts?.map((attempt) => attempt.model), [
+			"openai/gpt-5-mini", "anthropic/claude-sonnet-4",
+		]);
 	});
 
 	it("retries with fallback models when provider errors exit zero", async () => {

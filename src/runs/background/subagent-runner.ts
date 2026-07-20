@@ -40,7 +40,14 @@ import {
 	MAX_PARALLEL_CONCURRENCY,
 } from "../shared/parallel-utils.ts";
 import { buildPiArgs, cleanupTempDir } from "../shared/pi-args.ts";
-import { formatModelAttemptNote, isRetryableModelFailure } from "../shared/model-fallback.ts";
+import {
+	formatModelAttemptNote,
+	formatStartupRetryNote,
+	isRetryableModelFailure,
+	isStartupAuthUnavailableFailure,
+	MAX_STARTUP_AUTH_RETRIES,
+	startupRetryDelayMs,
+} from "../shared/model-fallback.ts";
 import { attachPostExitStdioGuard, trySignalChild } from "../../shared/post-exit-stdio-guard.ts";
 import { detectSubagentError, extractTextFromContent, extractToolArgsPreview, getFinalOutput } from "../../shared/utils.ts";
 import { evaluateCompletionMutationGuard } from "../shared/completion-guard.ts";
@@ -105,6 +112,7 @@ interface StepResult {
 	model?: string;
 	attemptedModels?: string[];
 	modelAttempts?: ModelAttempt[];
+	startupRetries?: number;
 	artifactPaths?: ArtifactPaths;
 	truncated?: boolean;
 }
@@ -124,6 +132,14 @@ function findLatestSessionFile(sessionDir: string): string | null {
 		// Session lookup is optional metadata.
 		return null;
 	}
+}
+
+function existingSessionFile(sessionFile: string | undefined): string | undefined {
+	return sessionFile && fs.existsSync(sessionFile) ? sessionFile : undefined;
+}
+
+function waitForStartupRetry(delayMs: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, delayMs));
 }
 
 function emptyUsage(): Usage {
@@ -201,6 +217,8 @@ interface RunPiStreamingResult {
 	finalOutput: string;
 	interrupted?: boolean;
 	observedMutationAttempt?: boolean;
+	sawAgentStart: boolean;
+	sawMessageStart: boolean;
 }
 
 function runPiStreaming(
@@ -232,6 +250,8 @@ function runPiStreaming(
 		let error: string | undefined;
 		let interrupted = false;
 		let observedMutationAttempt = false;
+		let sawAgentStart = false;
+		let sawMessageStart = false;
 		const rawStdoutLines: string[] = [];
 
 		const writeOutputLine = (line: string) => {
@@ -275,6 +295,8 @@ function runPiStreaming(
 
 			appendChildEvent(event);
 			onChildEvent?.(event);
+			if (event.type === "agent_start") sawAgentStart = true;
+			if (event.type === "message_start") sawMessageStart = true;
 
 			if (event.type === "tool_execution_start" && event.toolName) {
 				observedMutationAttempt = observedMutationAttempt || isMutatingTool(event.toolName, event.args);
@@ -393,10 +415,9 @@ function runPiStreaming(
 			clearStdioGuard();
 			if (stdoutBuf.trim()) processStdoutLine(stdoutBuf);
 			if (stderrBuf.trim()) appendChildLine("subagent.child.stderr", stderrBuf);
-			outputStream.end();
 			const finalOutput = getFinalOutput(messages) || rawStdoutLines.join("\n").trim();
 			const forcedDrainAfterFinalSuccess = forcedTerminationSignal && cleanTerminalAssistantStopReceived && !error;
-			resolve({
+			outputStream.end(() => resolve({
 				stderr,
 				exitCode: interrupted || forcedDrainAfterFinalSuccess ? 0 : forcedTerminationSignal || signal ? (exitCode ?? 1) : exitCode,
 				messages,
@@ -406,7 +427,9 @@ function runPiStreaming(
 				finalOutput,
 				interrupted,
 				observedMutationAttempt,
-			});
+				sawAgentStart,
+				sawMessageStart,
+			}));
 		});
 
 		child.on("error", (spawnError) => {
@@ -414,10 +437,9 @@ function runPiStreaming(
 			registerInterrupt?.(undefined);
 			clearDrainTimers();
 			clearStdioGuard();
-			outputStream.end();
 			const finalOutput = getFinalOutput(messages) || rawStdoutLines.join("\n").trim();
 			const spawnErrorMessage = spawnError instanceof Error ? spawnError.message : String(spawnError);
-			resolve({ stderr, exitCode: 1, messages, usage, model, error: error ?? spawnErrorMessage, finalOutput, observedMutationAttempt });
+			outputStream.end(() => resolve({ stderr, exitCode: 1, messages, usage, model, error: error ?? spawnErrorMessage, finalOutput, observedMutationAttempt, sawAgentStart, sawMessageStart }));
 		});
 	});
 }
@@ -562,6 +584,7 @@ async function runSingleStep(
 	model?: string;
 	attemptedModels?: string[];
 	modelAttempts?: ModelAttempt[];
+	startupRetries?: number;
 	artifactPaths?: ArtifactPaths;
 	interrupted?: boolean;
 	sessionFile?: string;
@@ -595,86 +618,95 @@ async function runSingleStep(
 	let finalResult: RunPiStreamingResult | undefined;
 	let finalOutputSnapshot: SingleOutputSnapshot | undefined;
 	let completionGuardTriggeredFinal = false;
+	let startupRetries = 0;
 
 	for (let index = 0; index < candidates.length; index++) {
 		const candidate = candidates[index];
-		ctx.onAttemptStart?.({ model: candidate, thinking: resolveEffectiveThinking(candidate, step.thinking) });
-		const outputSnapshot = captureSingleOutputSnapshot(step.outputPath);
-		const { args, env, tempDir } = buildPiArgs({
-			baseArgs: ["--mode", "json", "-p"],
-			task,
-			sessionEnabled,
-			sessionDir,
-			sessionFile: step.sessionFile,
-			model: candidate,
-			inheritProjectContext: step.inheritProjectContext,
-			inheritSkills: step.inheritSkills,
-			tools: step.tools,
-			extensions: step.extensions,
-			systemPrompt: step.systemPrompt,
-			systemPromptMode: step.systemPromptMode,
-			mcpDirectTools: step.mcpDirectTools,
-			promptFileStem: step.agent,
-			intercomSessionName: ctx.childIntercomTarget,
-			orchestratorIntercomTarget: ctx.orchestratorIntercomTarget,
-			runId: ctx.id,
-			childAgentName: step.agent,
-			childIndex: ctx.flatIndex,
-		});
-		const run = await runPiStreaming(
-			args,
-			step.cwd ?? ctx.cwd,
-			ctx.outputFile,
-			env,
-			ctx.piPackageRoot,
-			ctx.piArgv1,
-			step.maxSubagentDepth,
-			{ eventsPath, runId: ctx.id, stepIndex: ctx.flatIndex, agent: step.agent },
-			ctx.registerInterrupt,
-			ctx.onChildEvent,
-		);
-		cleanupTempDir(tempDir);
-
-		const hiddenError = run.exitCode === 0 && !run.error ? detectSubagentError(run.messages) : null;
-		const completionGuard = run.exitCode === 0 && !run.error && !hiddenError?.hasError
-			? evaluateCompletionMutationGuard({
-				agent: step.agent,
-				task,
-				messages: run.messages,
-				tools: step.tools,
-			})
-			: undefined;
-		const completionGuardTriggered = completionGuard?.triggered === true && !run.observedMutationAttempt;
-		const completionGuardError = completionGuardTriggered
-			? "Subagent completed without making edits for an implementation task.\nIt appears to have returned planning or scratchpad output instead of applying changes."
-			: undefined;
-		const effectiveExitCode = completionGuardTriggered
-			? 1
-			: hiddenError?.hasError
-				? (hiddenError.exitCode ?? 1)
-				: run.error && run.exitCode === 0
-					? 1
-					: run.exitCode;
-		const error = completionGuardError
-			?? (hiddenError?.hasError
-				? hiddenError.details
-					? `${hiddenError.errorType} failed (exit ${effectiveExitCode}): ${hiddenError.details}`
-					: `${hiddenError.errorType} failed with exit code ${effectiveExitCode}`
-				: run.error || (run.exitCode !== 0 && run.stderr.trim() ? run.stderr.trim() : undefined));
-		const attempt: ModelAttempt = {
-			model: candidate ?? run.model ?? step.model ?? "default",
-			success: effectiveExitCode === 0 && !error,
-			exitCode: effectiveExitCode,
-			error,
-			usage: run.usage,
-		};
-		modelAttempts.push(attempt);
 		if (candidate) attemptedModels.push(candidate);
-		completionGuardTriggeredFinal = completionGuardTriggered;
-		finalOutputSnapshot = outputSnapshot;
-		finalResult = { ...run, exitCode: effectiveExitCode, model: candidate ?? run.model, error };
-		if (attempt.success || completionGuardTriggered) break;
-		if (!isRetryableModelFailure(error) || index === candidates.length - 1) break;
+		let candidateStartupRetries = 0;
+		let attempt: ModelAttempt | undefined;
+		do {
+			ctx.onAttemptStart?.({ model: candidate, thinking: resolveEffectiveThinking(candidate, step.thinking) });
+			const outputSnapshot = captureSingleOutputSnapshot(step.outputPath);
+			const { args, env, tempDir } = buildPiArgs({
+				baseArgs: ["--mode", "json", "-p"],
+				task,
+				sessionEnabled,
+				sessionDir,
+				sessionFile: step.sessionFile,
+				model: candidate,
+				inheritProjectContext: step.inheritProjectContext,
+				inheritSkills: step.inheritSkills,
+				tools: step.tools,
+				extensions: step.extensions,
+				systemPrompt: step.systemPrompt,
+				systemPromptMode: step.systemPromptMode,
+				mcpDirectTools: step.mcpDirectTools,
+				promptFileStem: step.agent,
+				intercomSessionName: ctx.childIntercomTarget,
+				orchestratorIntercomTarget: ctx.orchestratorIntercomTarget,
+				runId: ctx.id,
+				childAgentName: step.agent,
+				childIndex: ctx.flatIndex,
+			});
+			const run = await runPiStreaming(
+				args,
+				step.cwd ?? ctx.cwd,
+				ctx.outputFile,
+				env,
+				ctx.piPackageRoot,
+				ctx.piArgv1,
+				step.maxSubagentDepth,
+				{ eventsPath, runId: ctx.id, stepIndex: ctx.flatIndex, agent: step.agent },
+				ctx.registerInterrupt,
+				ctx.onChildEvent,
+			);
+			cleanupTempDir(tempDir);
+
+			const hiddenError = run.exitCode === 0 && !run.error ? detectSubagentError(run.messages) : null;
+			const completionGuard = run.exitCode === 0 && !run.error && !hiddenError?.hasError
+				? evaluateCompletionMutationGuard({ agent: step.agent, task, messages: run.messages, tools: step.tools })
+				: undefined;
+			const completionGuardTriggered = completionGuard?.triggered === true && !run.observedMutationAttempt;
+			const completionGuardError = completionGuardTriggered
+				? "Subagent completed without making edits for an implementation task.\nIt appears to have returned planning or scratchpad output instead of applying changes."
+				: undefined;
+			const effectiveExitCode = completionGuardTriggered
+				? 1
+				: hiddenError?.hasError
+					? (hiddenError.exitCode ?? 1)
+					: run.error && run.exitCode === 0 ? 1 : run.exitCode;
+			const error = completionGuardError
+				?? (hiddenError?.hasError
+					? hiddenError.details
+						? `${hiddenError.errorType} failed (exit ${effectiveExitCode}): ${hiddenError.details}`
+						: `${hiddenError.errorType} failed with exit code ${effectiveExitCode}`
+					: run.error || (run.exitCode !== 0 ? (run.stderr.trim() || run.finalOutput || undefined) : undefined));
+			attempt = {
+				model: candidate ?? run.model ?? step.model ?? "default",
+				success: effectiveExitCode === 0 && !error,
+				exitCode: effectiveExitCode,
+				error,
+				usage: run.usage,
+			};
+			modelAttempts.push(attempt);
+			completionGuardTriggeredFinal = completionGuardTriggered;
+			finalOutputSnapshot = outputSnapshot;
+			finalResult = { ...run, exitCode: effectiveExitCode, model: candidate ?? run.model, error };
+			if (attempt.success || completionGuardTriggered || !isStartupAuthUnavailableFailure({
+				exitCode: effectiveExitCode,
+				error: `${error ?? ""}\n${run.stderr}\n${run.finalOutput}`,
+				sawAgentStart: run.sawAgentStart,
+				sawMessageStart: run.sawMessageStart,
+			}) || candidateStartupRetries >= MAX_STARTUP_AUTH_RETRIES) break;
+			const delayMs = startupRetryDelayMs(candidateStartupRetries);
+			candidateStartupRetries++;
+			startupRetries++;
+			attemptNotes.push(formatStartupRetryNote(attempt, delayMs));
+			await waitForStartupRetry(delayMs);
+		} while (true);
+		if (attempt?.success || completionGuardTriggeredFinal) break;
+		if (!attempt || !isRetryableModelFailure(attempt.error) || index === candidates.length - 1) break;
 		attemptNotes.push(formatModelAttemptNote(attempt, candidates[index + 1]));
 	}
 
@@ -714,6 +746,7 @@ async function runSingleStep(
 					model: finalResult?.model,
 					attemptedModels: attemptedModels.length > 0 ? attemptedModels : undefined,
 					modelAttempts,
+					startupRetries: startupRetries || undefined,
 					skills: step.skills,
 					timestamp: Date.now(),
 				}, null, 2),
@@ -727,11 +760,12 @@ async function runSingleStep(
 		output: outputForSummary,
 		exitCode: finalResult?.exitCode ?? 1,
 		error: finalResult?.error,
-		sessionFile: step.sessionFile,
+		sessionFile: existingSessionFile(step.sessionFile),
 		intercomTarget: ctx.childIntercomTarget,
 		model: finalResult?.model,
 		attemptedModels: attemptedModels.length > 0 ? attemptedModels : undefined,
 		modelAttempts,
+		startupRetries: startupRetries || undefined,
 		artifactPaths,
 		interrupted: finalResult?.interrupted,
 		completionGuardTriggered: completionGuardTriggeredFinal,
@@ -913,7 +947,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		steps: flatSteps.map((step) => ({
 			agent: step.agent,
 			status: "pending",
-			...(step.sessionFile ? { sessionFile: step.sessionFile } : {}),
+			...(existingSessionFile(step.sessionFile) ? { sessionFile: step.sessionFile } : {}),
 			skills: step.skills,
 			model: step.model,
 			thinking: step.thinking,
@@ -1348,8 +1382,8 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 							onAttemptStart: (attempt) => updateStepModel(fi, attempt.model, attempt.thinking),
 							onChildEvent: (event) => updateStepFromChildEvent(fi, event),
 						});
-						if (task.sessionFile) {
-							latestSessionFile = task.sessionFile;
+						if (singleResult.sessionFile) {
+							latestSessionFile = singleResult.sessionFile;
 						}
 
 						const taskEndTime = Date.now();
@@ -1361,8 +1395,10 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 						statusPayload.steps[fi].exitCode = singleResult.exitCode;
 						statusPayload.steps[fi].model = singleResult.model;
 						statusPayload.steps[fi].thinking = resolveEffectiveThinking(singleResult.model, statusPayload.steps[fi].thinking);
+						statusPayload.steps[fi].sessionFile = singleResult.sessionFile;
 						statusPayload.steps[fi].attemptedModels = singleResult.attemptedModels;
 						statusPayload.steps[fi].modelAttempts = singleResult.modelAttempts;
+						statusPayload.steps[fi].startupRetries = singleResult.startupRetries;
 						statusPayload.steps[fi].error = singleResult.error;
 						statusPayload.lastUpdate = taskEndTime;
 						writeAtomicJson(statusPath, statusPayload);
@@ -1423,6 +1459,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 						model: pr.model,
 						attemptedModels: pr.attemptedModels,
 						modelAttempts: pr.modelAttempts,
+						startupRetries: pr.startupRetries,
 						artifactPaths: pr.artifactPaths,
 					});
 				}
@@ -1493,8 +1530,8 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				onAttemptStart: (attempt) => updateStepModel(flatIndex, attempt.model, attempt.thinking),
 				onChildEvent: (event) => updateStepFromChildEvent(flatIndex, event),
 			});
-			if (seqStep.sessionFile) {
-				latestSessionFile = seqStep.sessionFile;
+			if (singleResult.sessionFile) {
+				latestSessionFile = singleResult.sessionFile;
 			}
 
 			previousOutput = singleResult.output;
@@ -1508,6 +1545,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				model: singleResult.model,
 				attemptedModels: singleResult.attemptedModels,
 				modelAttempts: singleResult.modelAttempts,
+				startupRetries: singleResult.startupRetries,
 				artifactPaths: singleResult.artifactPaths,
 			});
 
@@ -1539,8 +1577,10 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			statusPayload.steps[flatIndex].exitCode = singleResult.exitCode;
 			statusPayload.steps[flatIndex].model = singleResult.model;
 			statusPayload.steps[flatIndex].thinking = resolveEffectiveThinking(singleResult.model, statusPayload.steps[flatIndex].thinking);
+			statusPayload.steps[flatIndex].sessionFile = singleResult.sessionFile;
 			statusPayload.steps[flatIndex].attemptedModels = singleResult.attemptedModels;
 			statusPayload.steps[flatIndex].modelAttempts = singleResult.modelAttempts;
+			statusPayload.steps[flatIndex].startupRetries = singleResult.startupRetries;
 			statusPayload.steps[flatIndex].error = singleResult.error;
 			if (stepTokens) {
 				statusPayload.steps[flatIndex].tokens = stepTokens;
@@ -1633,7 +1673,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		clearInterval(activityTimer);
 		activityTimer = undefined;
 	}
-	const effectiveSessionFile = sessionFile ?? latestSessionFile;
+	const effectiveSessionFile = existingSessionFile(sessionFile) ?? existingSessionFile(latestSessionFile);
 	const runEndedAt = Date.now();
 	statusPayload.state = interrupted ? "paused" : results.every((r) => r.success) ? "complete" : "failed";
 	statusPayload.activityState = undefined;
@@ -1698,6 +1738,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				model: r.model,
 				attemptedModels: r.attemptedModels,
 				modelAttempts: r.modelAttempts,
+				startupRetries: r.startupRetries,
 				artifactPaths: r.artifactPaths,
 				truncated: r.truncated,
 			})),
