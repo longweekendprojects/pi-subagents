@@ -565,7 +565,9 @@ interface SingleStepContext {
 	registerInterrupt?: (interrupt: (() => void) | undefined) => void;
 	childIntercomTarget?: string;
 	orchestratorIntercomTarget?: string;
+	isInterrupted?: () => boolean;
 	onAttemptStart?: (attempt: { model?: string; thinking?: string }) => void;
+	onStartupRetry?: (retry: { model?: string; delayMs: number }) => void;
 	onChildEvent?: (event: ChildEvent) => void;
 }
 
@@ -616,6 +618,18 @@ async function runSingleStep(
 	let finalOutputSnapshot: SingleOutputSnapshot | undefined;
 	let completionGuardTriggeredFinal = false;
 	let startupRetries = 0;
+	const interruptedResult = () => ({
+		agent: step.agent,
+		output: "",
+		exitCode: finalResult?.exitCode ?? 0,
+		error: finalResult?.error,
+		model: finalResult?.model,
+		attemptedModels: attemptedModels.length > 0 ? attemptedModels : undefined,
+		modelAttempts,
+		startupRetries: startupRetries || undefined,
+		artifactPaths,
+		interrupted: true,
+	});
 
 	for (let index = 0; index < candidates.length; index++) {
 		const candidate = candidates[index];
@@ -623,6 +637,7 @@ async function runSingleStep(
 		let candidateStartupRetries = 0;
 		let attempt: ModelAttempt | undefined;
 		do {
+			if (ctx.isInterrupted?.()) return interruptedResult();
 			ctx.onAttemptStart?.({ model: candidate, thinking: resolveEffectiveThinking(candidate, step.thinking) });
 			const outputSnapshot = captureSingleOutputSnapshot(step.outputPath);
 			const { args, env, tempDir } = buildPiArgs({
@@ -697,10 +712,12 @@ async function runSingleStep(
 				sawMessageStart: run.sawMessageStart,
 			}) || candidateStartupRetries >= MAX_STARTUP_AUTH_RETRIES) break;
 			const delayMs = startupRetryDelayMs(candidateStartupRetries);
+			ctx.onStartupRetry?.({ model: candidate, delayMs });
+			await waitForStartupRetry(delayMs);
+			if (ctx.isInterrupted?.()) return interruptedResult();
 			candidateStartupRetries++;
 			startupRetries++;
 			attemptNotes.push(formatStartupRetryNote(attempt, delayMs));
-			await waitForStartupRetry(delayMs);
 		} while (true);
 		if (attempt?.success || completionGuardTriggeredFinal) break;
 		if (!attempt || !isRetryableModelFailure(attempt.error) || index === candidates.length - 1) break;
@@ -1322,6 +1339,23 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 					concurrency,
 					async (task, taskIdx) => {
 						const fi = groupStartFlatIndex + taskIdx;
+						if (interrupted) {
+							return {
+								agent: task.agent,
+								output: "",
+								exitCode: 0 as number | null,
+								error: undefined,
+								model: undefined,
+								attemptedModels: undefined,
+								modelAttempts: undefined,
+								startupRetries: undefined,
+								artifactPaths: undefined,
+								sessionFile: undefined,
+								intercomTarget: undefined,
+								skipped: false,
+								interrupted: true,
+							};
+						}
 						if (aborted && failFast) {
 							const skippedAt = Date.now();
 							statusPayload.steps[fi].status = "failed";
@@ -1376,9 +1410,14 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 							registerInterrupt: (interrupt) => {
 								activeChildInterrupt = interrupt;
 							},
+							isInterrupted: () => interrupted,
 							onAttemptStart: (attempt) => updateStepModel(fi, attempt.model, attempt.thinking),
+							onStartupRetry: (retry) => appendJsonl(eventsPath, JSON.stringify({
+								type: "subagent.step.startup_retry", ts: Date.now(), runId: id, stepIndex: fi, agent: task.agent, ...retry,
+							})),
 							onChildEvent: (event) => updateStepFromChildEvent(fi, event),
 						});
+						if (interrupted || singleResult.interrupted) return singleResult;
 						if (singleResult.sessionFile) {
 							latestSessionFile = singleResult.sessionFile;
 						}
@@ -1423,6 +1462,8 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 						return { ...singleResult, skipped: false };
 					},
 				);
+
+				if (interrupted || parallelResults.some((result) => result.interrupted)) break;
 
 				flatIndex += group.parallel.length;
 
@@ -1524,9 +1565,29 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				registerInterrupt: (interrupt) => {
 					activeChildInterrupt = interrupt;
 				},
+				isInterrupted: () => interrupted,
 				onAttemptStart: (attempt) => updateStepModel(flatIndex, attempt.model, attempt.thinking),
+				onStartupRetry: (retry) => appendJsonl(eventsPath, JSON.stringify({
+					type: "subagent.step.startup_retry", ts: Date.now(), runId: id, stepIndex: flatIndex, agent: seqStep.agent, ...retry,
+				})),
 				onChildEvent: (event) => updateStepFromChildEvent(flatIndex, event),
 			});
+			if (interrupted || singleResult.interrupted) {
+				results.push({
+					agent: singleResult.agent,
+					output: singleResult.output,
+					error: singleResult.error,
+					success: singleResult.exitCode === 0,
+					sessionFile: singleResult.sessionFile,
+					intercomTarget: singleResult.intercomTarget,
+					model: singleResult.model,
+					attemptedModels: singleResult.attemptedModels,
+					modelAttempts: singleResult.modelAttempts,
+					startupRetries: singleResult.startupRetries,
+					artifactPaths: singleResult.artifactPaths,
+				});
+				break;
+			}
 			if (singleResult.sessionFile) {
 				latestSessionFile = singleResult.sessionFile;
 			}

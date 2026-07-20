@@ -132,6 +132,34 @@ async function waitForAsyncResultFile(id: string, timeoutMs = 15_000): Promise<s
 	return resultPath;
 }
 
+function readAsyncEvents(asyncDir: string): Array<Record<string, unknown>> {
+	const eventsPath = path.join(asyncDir, "events.jsonl");
+	try {
+		return fs.readFileSync(eventsPath, "utf-8")
+			.split("\n")
+			.filter(Boolean)
+			.flatMap((line) => {
+				try {
+					return [JSON.parse(line) as Record<string, unknown>];
+				} catch {
+					return [];
+				}
+			});
+	} catch {
+		return [];
+	}
+}
+
+async function waitForAsyncEvent(asyncDir: string, predicate: (event: Record<string, unknown>) => boolean, timeoutMs = 15_000): Promise<Record<string, unknown>> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() <= deadline) {
+		const event = readAsyncEvents(asyncDir).find(predicate);
+		if (event) return event;
+		await new Promise((resolve) => setTimeout(resolve, 20));
+	}
+	assert.fail(`Timed out waiting for an async event in ${asyncDir}`);
+}
+
 describe("async execution utilities", { skip: !available ? "pi packages not available" : undefined }, () => {
 	let tempDir: string;
 	let mockPi: MockPi;
@@ -537,6 +565,49 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(output.match(/\[startup retry\]/g)?.length, 2);
 		assert.match(output, /\[fallback\].*openai\/gpt-5-mini.*anthropic\/claude-sonnet-4/);
 		assert.equal(mockPi.callCount(), 4);
+	});
+
+	it("pauses startup retry backoff without spawning another model attempt", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({ exitCode: 1, stderr: "No credentials found" });
+		mockPi.onCall({ output: "Fallback must not start" });
+		const id = `async-startup-auth-interrupt-${Date.now().toString(36)}`;
+		const asyncDir = path.join(ASYNC_DIR, id);
+		executeAsyncSingle(id, {
+			agent: "worker",
+			task: "Do work",
+			agentConfig: makeAgent("worker", {
+				model: "openai/gpt-5-mini",
+				fallbackModels: ["anthropic/claude-sonnet-4"],
+			}),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			sessionRoot: path.join(tempDir, "sessions"),
+			maxSubagentDepth: 2,
+		});
+
+		await waitForAsyncEvent(asyncDir, (event) => event.type === "subagent.step.startup_retry");
+		const runningStatus = JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf-8")) as AsyncStatusPayload & { pid: number };
+		assert.equal(runningStatus.state, "running");
+		assert.equal(mockPi.callCount(), 1);
+		process.kill(runningStatus.pid, process.platform === "win32" ? "SIGBREAK" : "SIGUSR2");
+
+		const resultPath = await waitForAsyncResultFile(id);
+		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload & { state?: string };
+		const status = JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf-8")) as AsyncStatusPayload;
+		const eventTypes = readAsyncEvents(asyncDir).map((event) => event.type);
+		assert.equal(mockPi.callCount(), 1);
+		assert.equal(payload.success, false);
+		assert.equal(payload.state, "paused");
+		assert.equal(payload.results.length, 1);
+		assert.deepEqual(payload.results[0]?.attemptedModels, ["openai/gpt-5-mini"]);
+		assert.equal(payload.results[0]?.modelAttempts?.length, 1);
+		assert.equal(payload.results[0]?.startupRetries, undefined);
+		assert.equal(status.state, "paused");
+		assert.equal(status.steps?.[0]?.status, "paused");
+		assert.equal(eventTypes.filter((type) => type === "subagent.step.started").length, 1);
+		assert.equal(eventTypes.includes("subagent.step.completed"), false);
+		assert.equal(eventTypes.includes("subagent.step.failed"), false);
 	});
 
 	it("background runs fall back immediately after message startup without a same-model retry", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
