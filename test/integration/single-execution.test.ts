@@ -421,9 +421,9 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(mockPi.callCount(), 2);
 	});
 
-	it("retries auth-empty startup failures twice before falling back", async () => {
+	it("retries No credentials found twice before falling back", async () => {
 		for (let attempt = 0; attempt < 3; attempt++) {
-			mockPi.onCall({ exitCode: 1, stderr: "No API key found for provider" });
+			mockPi.onCall({ exitCode: 1, stderr: "No credentials found" });
 		}
 		mockPi.onCall({ output: "Recovered on fallback" });
 		const agents = [makeAgent("echo", {
@@ -432,16 +432,21 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		})];
 
 		const result = await runSync(tempDir, agents, "echo", "Task", { runId: "startup-auth-retry-sync" });
+		const notes = result.progress.recentOutput.join("\n");
 
 		assert.equal(result.exitCode, 0);
+		assert.equal(result.model, "anthropic/claude-sonnet-4");
 		assert.equal(result.startupRetries, 2);
 		assert.equal(mockPi.callCount(), 4);
 		assert.deepEqual(result.attemptedModels, ["openai/gpt-5-mini", "anthropic/claude-sonnet-4"]);
-		assert.deepEqual(result.modelAttempts?.map((attempt) => attempt.model), [
-			"openai/gpt-5-mini", "openai/gpt-5-mini", "openai/gpt-5-mini", "anthropic/claude-sonnet-4",
+		assert.deepEqual(result.modelAttempts?.map((attempt) => ({ model: attempt.model, success: attempt.success, error: attempt.error })), [
+			{ model: "openai/gpt-5-mini", success: false, error: "No credentials found" },
+			{ model: "openai/gpt-5-mini", success: false, error: "No credentials found" },
+			{ model: "openai/gpt-5-mini", success: false, error: "No credentials found" },
+			{ model: "anthropic/claude-sonnet-4", success: true, error: undefined },
 		]);
-		assert.match(result.progress.recentOutput.join("\n"), /\[startup retry\]/);
-		assert.match(result.progress.recentOutput.join("\n"), /\[fallback\]/);
+		assert.match(notes, /\[startup retry\].*No credentials found/);
+		assert.match(notes, /\[fallback\].*openai\/gpt-5-mini.*anthropic\/claude-sonnet-4/);
 	});
 
 	it("baselines output files for each startup retry before using a fallback", async () => {
@@ -463,11 +468,11 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(fs.readFileSync(outputPath, "utf-8"), "fallback output");
 	});
 
-	it("does not retry the same model after startup activity", async () => {
+	it("falls back immediately after message startup without a same-model retry", async () => {
 		mockPi.onCall({
-			jsonl: [{ type: "agent_start" }],
+			jsonl: [{ type: "message_start" }],
 			exitCode: 1,
-			stderr: "No API key found for provider",
+			stderr: "No credentials found",
 		});
 		mockPi.onCall({ output: "Recovered on fallback" });
 		const agents = [makeAgent("echo", {
@@ -475,14 +480,20 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 			fallbackModels: ["anthropic/claude-sonnet-4"],
 		})];
 
-		const result = await runSync(tempDir, agents, "echo", "Task", { runId: "startup-auth-activity-exclusion" });
+		const result = await runSync(tempDir, agents, "echo", "Task", { runId: "startup-auth-message-start" });
+		const notes = result.progress.recentOutput.join("\n");
 
 		assert.equal(result.exitCode, 0);
+		assert.equal(result.model, "anthropic/claude-sonnet-4");
 		assert.equal(result.startupRetries, undefined);
 		assert.equal(mockPi.callCount(), 2);
-		assert.deepEqual(result.modelAttempts?.map((attempt) => attempt.model), [
-			"openai/gpt-5-mini", "anthropic/claude-sonnet-4",
+		assert.deepEqual(result.attemptedModels, ["openai/gpt-5-mini", "anthropic/claude-sonnet-4"]);
+		assert.deepEqual(result.modelAttempts?.map((attempt) => ({ model: attempt.model, success: attempt.success, error: attempt.error })), [
+			{ model: "openai/gpt-5-mini", success: false, error: "No credentials found" },
+			{ model: "anthropic/claude-sonnet-4", success: true, error: undefined },
 		]);
+		assert.doesNotMatch(notes, /\[startup retry\]/);
+		assert.match(notes, /\[fallback\].*openai\/gpt-5-mini.*anthropic\/claude-sonnet-4/);
 	});
 
 	it("retries with fallback models when provider errors exit zero", async () => {

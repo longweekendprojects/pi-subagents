@@ -109,9 +109,15 @@ const RETRYABLE_MODEL_FAILURE_PATTERNS = [
 	/\b504\b/,
 ];
 
+function isStartupAuthUnavailableMessage(error: string | undefined): boolean {
+	if (!error) return false;
+	return STARTUP_AUTH_UNAVAILABLE_PATTERNS.some((pattern) => pattern.test(error));
+}
+
 export function isRetryableModelFailure(error: string | undefined): boolean {
 	if (!error) return false;
-	return RETRYABLE_MODEL_FAILURE_PATTERNS.some((pattern) => pattern.test(error));
+	return RETRYABLE_MODEL_FAILURE_PATTERNS.some((pattern) => pattern.test(error))
+		|| isStartupAuthUnavailableMessage(error);
 }
 
 export function isStartupAuthUnavailableFailure(evidence: StartupAttemptEvidence): boolean {
@@ -120,8 +126,7 @@ export function isStartupAuthUnavailableFailure(evidence: StartupAttemptEvidence
 		&& evidence.exitCode !== 0
 		&& !evidence.sawAgentStart
 		&& !evidence.sawMessageStart
-		&& Boolean(evidence.error)
-		&& STARTUP_AUTH_UNAVAILABLE_PATTERNS.some((pattern) => pattern.test(evidence.error!));
+		&& isStartupAuthUnavailableMessage(evidence.error);
 }
 
 export function startupRetryDelayMs(retryIndex: number, random: () => number = Math.random): number {

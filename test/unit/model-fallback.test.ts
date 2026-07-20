@@ -76,25 +76,39 @@ describe("model fallback helpers", () => {
 		assert.equal(isRetryableModelFailure(undefined), false);
 	});
 
-	it("classifies only auth-empty startup failures for same-model retries", () => {
-		assert.equal(isStartupAuthUnavailableFailure({
-			exitCode: 1,
-			error: "No API key found for provider",
-			sawAgentStart: false,
-			sawMessageStart: false,
-		}), true);
-		assert.equal(isStartupAuthUnavailableFailure({
-			exitCode: 0,
-			error: "No API key found for provider",
-			sawAgentStart: false,
-			sawMessageStart: false,
-		}), false);
-		assert.equal(isStartupAuthUnavailableFailure({
-			exitCode: 1,
-			error: "No API key found for provider",
-			sawAgentStart: true,
-			sawMessageStart: false,
-		}), false);
+	const startupAuthMessages = [
+		"No API key found",
+		"No API key available",
+		"No API key is available",
+		"No API key configured",
+		"No API key is configured",
+		"No authentication token found",
+		"No credential found",
+		"No credentials found",
+	];
+	for (const error of startupAuthMessages) {
+		it(`classifies ${JSON.stringify(error)} as a retryable startup-auth failure`, () => {
+			assert.equal(isStartupAuthUnavailableFailure({
+				exitCode: 1,
+				error,
+				sawAgentStart: false,
+				sawMessageStart: false,
+			}), true);
+			assert.equal(isRetryableModelFailure(error), true);
+		});
+	}
+
+	it("only retries startup-auth failures before agent or message startup", () => {
+		for (const evidence of [
+			{ exitCode: 0, sawAgentStart: false, sawMessageStart: false },
+			{ exitCode: 1, sawAgentStart: true, sawMessageStart: false },
+			{ exitCode: 1, sawAgentStart: false, sawMessageStart: true },
+		]) {
+			assert.equal(isStartupAuthUnavailableFailure({
+				...evidence,
+				error: "No credentials found",
+			}), false);
+		}
 		assert.equal(isStartupAuthUnavailableFailure({
 			exitCode: 1,
 			error: "invalid API key",

@@ -498,9 +498,9 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(mockPi.callCount(), 2);
 	});
 
-	it("background runs retry auth-empty startup failures twice before falling back", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+	it("background runs retry No credentials found twice before falling back", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		for (let attempt = 0; attempt < 3; attempt++) {
-			mockPi.onCall({ exitCode: 1, stderr: "No API key found for provider" });
+			mockPi.onCall({ exitCode: 1, stderr: "No credentials found" });
 		}
 		mockPi.onCall({ output: "Recovered asynchronously" });
 		const id = `async-startup-auth-${Date.now().toString(36)}`;
@@ -522,14 +522,59 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		const resultPath = await waitForAsyncResultFile(id);
 		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
 		const status = JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf-8")) as AsyncStatusPayload;
+		const output = payload.results[0]?.output ?? "";
 		assert.equal(payload.success, true);
+		assert.equal(payload.results[0]?.model, "anthropic/claude-sonnet-4");
 		assert.equal(payload.results[0]?.startupRetries, 2);
 		assert.equal(status.steps?.[0]?.startupRetries, 2);
 		assert.deepEqual(payload.results[0]?.attemptedModels, ["openai/gpt-5-mini", "anthropic/claude-sonnet-4"]);
-		assert.equal(payload.results[0]?.modelAttempts?.length, 4);
-		assert.match(payload.results[0]?.output ?? "", /\[startup retry\]/);
-		assert.match(payload.results[0]?.output ?? "", /\[fallback\]/);
+		assert.deepEqual(payload.results[0]?.modelAttempts?.map((attempt) => ({ success: attempt.success, error: attempt.error })), [
+			{ success: false, error: "No credentials found" },
+			{ success: false, error: "No credentials found" },
+			{ success: false, error: "No credentials found" },
+			{ success: true, error: undefined },
+		]);
+		assert.equal(output.match(/\[startup retry\]/g)?.length, 2);
+		assert.match(output, /\[fallback\].*openai\/gpt-5-mini.*anthropic\/claude-sonnet-4/);
 		assert.equal(mockPi.callCount(), 4);
+	});
+
+	it("background runs fall back immediately after message startup without a same-model retry", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({
+			jsonl: [{ type: "message_start" }],
+			exitCode: 1,
+			stderr: "No credentials found",
+		});
+		mockPi.onCall({ output: "Recovered asynchronously" });
+		const id = `async-startup-auth-message-start-${Date.now().toString(36)}`;
+		executeAsyncSingle(id, {
+			agent: "worker",
+			task: "Do work",
+			agentConfig: makeAgent("worker", {
+				model: "openai/gpt-5-mini",
+				fallbackModels: ["anthropic/claude-sonnet-4"],
+			}),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			sessionRoot: path.join(tempDir, "sessions"),
+			maxSubagentDepth: 2,
+		});
+
+		const resultPath = await waitForAsyncResultFile(id);
+		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+		const output = payload.results[0]?.output ?? "";
+		assert.equal(payload.success, true);
+		assert.equal(payload.results[0]?.model, "anthropic/claude-sonnet-4");
+		assert.equal(payload.results[0]?.startupRetries, undefined);
+		assert.equal(mockPi.callCount(), 2);
+		assert.deepEqual(payload.results[0]?.attemptedModels, ["openai/gpt-5-mini", "anthropic/claude-sonnet-4"]);
+		assert.deepEqual(payload.results[0]?.modelAttempts?.map((attempt) => ({ success: attempt.success, error: attempt.error })), [
+			{ success: false, error: "No credentials found" },
+			{ success: true, error: undefined },
+		]);
+		assert.doesNotMatch(output, /\[startup retry\]/);
+		assert.match(output, /\[fallback\].*openai\/gpt-5-mini.*anthropic\/claude-sonnet-4/);
 	});
 
 	it("background runs fail zero-exit provider errors when no fallback succeeds", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
