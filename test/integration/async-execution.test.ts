@@ -160,6 +160,15 @@ async function waitForAsyncEvent(asyncDir: string, predicate: (event: Record<str
 	assert.fail(`Timed out waiting for an async event in ${asyncDir}`);
 }
 
+async function waitForAsyncCondition(description: string, predicate: () => boolean, timeoutMs = 15_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() <= deadline) {
+		if (predicate()) return;
+		await new Promise((resolve) => setTimeout(resolve, 20));
+	}
+	assert.fail(`Timed out waiting for ${description}`);
+}
+
 describe("async execution utilities", { skip: !available ? "pi packages not available" : undefined }, () => {
 	let tempDir: string;
 	let mockPi: MockPi;
@@ -565,6 +574,54 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(output.match(/\[startup retry\]/g)?.length, 2);
 		assert.match(output, /\[fallback\].*openai\/gpt-5-mini.*anthropic\/claude-sonnet-4/);
 		assert.equal(mockPi.callCount(), 4);
+	});
+
+	it("keeps queued background parallel tasks pending after a pause and finishes aggregation", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const concurrency = 2;
+		const tasks = Array.from({ length: 4 }, (_, index) => ({ agent: `worker-${index}`, task: `Do task ${index}` }));
+		for (let index = 0; index < tasks.length; index++) {
+			mockPi.onCall({ delay: 600, output: `task ${index} finished` });
+		}
+		const id = `async-parallel-interrupt-${Date.now().toString(36)}`;
+		const asyncDir = path.join(ASYNC_DIR, id);
+		const statusPath = path.join(asyncDir, "status.json");
+		executeAsyncChain(id, {
+			chain: [{ parallel: tasks, concurrency }],
+			resultMode: "parallel",
+			agents: tasks.map((task) => makeAgent(task.agent)),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			sessionRoot: path.join(tempDir, "sessions"),
+			maxSubagentDepth: 2,
+		});
+
+		await waitForAsyncCondition("the initial parallel children to be running", () => {
+			if (!fs.existsSync(statusPath)) return false;
+			const status = JSON.parse(fs.readFileSync(statusPath, "utf-8")) as AsyncStatusPayload;
+			return mockPi.callCount() === concurrency && status.steps?.filter((step) => step.status === "running").length === concurrency;
+		});
+		const runningStatus = JSON.parse(fs.readFileSync(statusPath, "utf-8")) as AsyncStatusPayload & { pid: number };
+		assert.deepEqual(runningStatus.steps?.map((step) => step.status), ["running", "running", "pending", "pending"]);
+		process.kill(runningStatus.pid, process.platform === "win32" ? "SIGBREAK" : "SIGUSR2");
+
+		const resultPath = await waitForAsyncResultFile(id);
+		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload & { state?: string };
+		const pausedStatus = JSON.parse(fs.readFileSync(statusPath, "utf-8")) as AsyncStatusPayload;
+		const events = readAsyncEvents(asyncDir);
+		const startedStepIndexes = events
+			.filter((event) => event.type === "subagent.step.started")
+			.map((event) => event.stepIndex);
+		const parallelCompleted = events.find((event) => event.type === "subagent.parallel.completed");
+
+		assert.equal(mockPi.callCount(), concurrency);
+		assert.equal(payload.success, false);
+		assert.equal(payload.state, "paused");
+		assert.equal(payload.results.length, tasks.length);
+		assert.equal(pausedStatus.state, "paused");
+		assert.deepEqual(pausedStatus.steps?.map((step) => step.status), ["paused", "paused", "pending", "pending"]);
+		assert.deepEqual(startedStepIndexes.sort((left, right) => Number(left) - Number(right)), [0, 1]);
+		assert.equal(parallelCompleted?.success, true);
 	});
 
 	it("pauses startup retry backoff without spawning another model attempt", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {

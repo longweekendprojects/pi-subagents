@@ -1338,7 +1338,6 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 					group.parallel,
 					concurrency,
 					async (task, taskIdx) => {
-						const fi = groupStartFlatIndex + taskIdx;
 						if (interrupted) {
 							return {
 								agent: task.agent,
@@ -1356,6 +1355,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 								interrupted: true,
 							};
 						}
+						const fi = groupStartFlatIndex + taskIdx;
 						if (aborted && failFast) {
 							const skippedAt = Date.now();
 							statusPayload.steps[fi].status = "failed";
@@ -1462,8 +1462,6 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 						return { ...singleResult, skipped: false };
 					},
 				);
-
-				if (interrupted || parallelResults.some((result) => result.interrupted)) break;
 
 				flatIndex += group.parallel.length;
 
