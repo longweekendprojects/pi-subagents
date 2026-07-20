@@ -47,6 +47,7 @@ import {
 	isStartupAuthUnavailableFailure,
 	MAX_STARTUP_AUTH_RETRIES,
 	startupRetryDelayMs,
+	waitForStartupRetry,
 } from "../shared/model-fallback.ts";
 import { attachPostExitStdioGuard, trySignalChild } from "../../shared/post-exit-stdio-guard.ts";
 import { detectSubagentError, extractTextFromContent, extractToolArgsPreview, getFinalOutput } from "../../shared/utils.ts";
@@ -136,10 +137,6 @@ function findLatestSessionFile(sessionDir: string): string | null {
 
 function existingSessionFile(sessionFile: string | undefined): string | undefined {
 	return sessionFile && fs.existsSync(sessionFile) ? sessionFile : undefined;
-}
-
-function waitForStartupRetry(delayMs: number): Promise<void> {
-	return new Promise((resolve) => setTimeout(resolve, delayMs));
 }
 
 function emptyUsage(): Usage {

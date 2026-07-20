@@ -130,6 +130,10 @@ export function startupRetryDelayMs(retryIndex: number, random: () => number = M
 	return Math.min(STARTUP_RETRY_MAX_DELAY_MS, exponentialDelay + jitter);
 }
 
+export function waitForStartupRetry(delayMs: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, delayMs));
+}
+
 export function formatStartupRetryNote(attempt: ModelAttemptSummary, delayMs: number): string {
 	const failure = attempt.error?.trim() || `exit ${attempt.exitCode ?? 1}`;
 	return `[startup retry] ${attempt.model} could not start: ${failure}. Retrying the same model in ${delayMs}ms.`;

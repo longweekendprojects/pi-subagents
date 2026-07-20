@@ -55,6 +55,7 @@ import {
 	isStartupAuthUnavailableFailure,
 	MAX_STARTUP_AUTH_RETRIES,
 	startupRetryDelayMs,
+	waitForStartupRetry,
 } from "../shared/model-fallback.ts";
 import {
 	createMutatingFailureState,
@@ -129,10 +130,6 @@ interface SingleAttemptResult extends SingleResult {
 		sawMessageStart: boolean;
 		text: string;
 	};
-}
-
-function waitForStartupRetry(delayMs: number): Promise<void> {
-	return new Promise((resolve) => setTimeout(resolve, delayMs));
 }
 
 async function runSingleAttempt(
