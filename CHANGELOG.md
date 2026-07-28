@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.24.6] - 2026-07-27
+
+### Added
+- Support Pi's `max` thinking level in model suffixes, model capability filtering, run status, and the chain clarify selector.
+
+## [0.24.5] - 2026-07-20
+
+### Fixed
+- Retry child startup authentication failures before using fallback models, preserve paused background retries, and aggregate paused parallel runs correctly.
+
+## [0.24.4] - 2026-07-01
+
+### Added
+- Allow child agents that explicitly declare the `subagent` tool to fan out within the configured recursion limit.
+
+### Changed
+- Guide context and planning workflows to reuse or extend suitable existing code before adding new modules.
+
+### Fixed
+- Exempt read-only agents from mutation-completion checks.
+
 ## [0.24.3] - 2026-05-14
 
 ### Added

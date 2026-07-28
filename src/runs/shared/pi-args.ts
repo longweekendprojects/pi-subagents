@@ -2,8 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-
-const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"];
+import { THINKING_LEVELS } from "../../shared/model-info.ts";
 const TASK_ARG_LIMIT = 8000;
 const PROMPT_RUNTIME_EXTENSION_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), "subagent-prompt-runtime.ts");
 export const SUBAGENT_CHILD_ENV = "PI_SUBAGENT_CHILD";
@@ -45,7 +44,8 @@ interface BuildPiArgsResult {
 export function applyThinkingSuffix(model: string | undefined, thinking: string | undefined): string | undefined {
 	if (!model || !thinking || thinking === "off") return model;
 	const colonIdx = model.lastIndexOf(":");
-	if (colonIdx !== -1 && THINKING_LEVELS.includes(model.substring(colonIdx + 1))) return model;
+	const suffix = colonIdx === -1 ? "" : model.substring(colonIdx + 1);
+	if (THINKING_LEVELS.some((level) => level === suffix)) return model;
 	return `${model}:${thinking}`;
 }
 

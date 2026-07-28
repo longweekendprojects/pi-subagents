@@ -20,43 +20,47 @@ describe("model info helpers", () => {
 		assert.equal(findModelInfo("openai/gpt-5-mini:high", ambiguousModels, "github-copilot")?.fullId, "openai/gpt-5-mini");
 	});
 
-	it("keeps the legacy full thinking list for reasoning models without per-level metadata", () => {
+	it("offers the base levels when model metadata is unavailable", () => {
+		assert.deepEqual(getSupportedThinkingLevels(undefined), ["off", "minimal", "low", "medium", "high"]);
+	});
+
+	it("offers the base levels to reasoning models without level metadata", () => {
 		assert.deepEqual(
 			getSupportedThinkingLevels({ provider: "openai", id: "gpt-5", fullId: "openai/gpt-5", reasoning: true }),
-			["off", "minimal", "low", "medium", "high", "xhigh"],
+			["off", "minimal", "low", "medium", "high"],
 		);
 	});
 
-	it("keeps the legacy full thinking list when older model metadata omits reasoning", () => {
-		assert.deepEqual(
-			getSupportedThinkingLevels({ provider: "openai", id: "gpt-5", fullId: "openai/gpt-5" }),
-			["off", "minimal", "low", "medium", "high", "xhigh"],
-		);
-	});
-
-	it("filters levels only when per-level metadata is present", () => {
+	it("requires independent non-null mappings for xhigh and max", () => {
 		assert.deepEqual(
 			getSupportedThinkingLevels({
 				provider: "deepseek",
-				id: "deepseek-v4-pro",
-				fullId: "deepseek/deepseek-v4-pro",
+				id: "xhigh-only",
+				fullId: "deepseek/xhigh-only",
 				reasoning: true,
-				thinkingLevelMap: { minimal: null, low: null, medium: null, high: "high", xhigh: "max" },
+				thinkingLevelMap: { off: null, xhigh: "xhigh", max: null },
 			}),
-			["off", "high", "xhigh"],
+			["minimal", "low", "medium", "high", "xhigh"],
 		);
-	});
-
-	it("honors metadata that marks off unsupported", () => {
+		assert.deepEqual(
+			getSupportedThinkingLevels({
+				provider: "deepseek",
+				id: "max-only",
+				fullId: "deepseek/max-only",
+				reasoning: true,
+				thinkingLevelMap: { high: null, xhigh: null, max: "max" },
+			}),
+			["off", "minimal", "low", "medium", "max"],
+		);
 		assert.deepEqual(
 			getSupportedThinkingLevels({
 				provider: "always-thinking",
 				id: "model",
 				fullId: "always-thinking/model",
-				reasoning: true,
-				thinkingLevelMap: { off: null, minimal: null, low: null, medium: null, high: "high" },
+				reasoning: false,
+				thinkingLevelMap: { max: "max" },
 			}),
-			["high"],
+			["off"],
 		);
 	});
 });
