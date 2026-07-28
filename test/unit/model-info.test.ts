@@ -20,14 +20,14 @@ describe("model info helpers", () => {
 		assert.equal(findModelInfo("openai/gpt-5-mini:high", ambiguousModels, "github-copilot")?.fullId, "openai/gpt-5-mini");
 	});
 
-	it("offers the base levels when model metadata is unavailable", () => {
-		assert.deepEqual(getSupportedThinkingLevels(undefined), ["off", "minimal", "low", "medium", "high"]);
+	it("keeps legacy levels but withholds max when model metadata is unavailable", () => {
+		assert.deepEqual(getSupportedThinkingLevels(undefined), ["off", "minimal", "low", "medium", "high", "xhigh"]);
 	});
 
-	it("offers the base levels to reasoning models without level metadata", () => {
+	it("keeps legacy levels but withholds max for reasoning models without level metadata", () => {
 		assert.deepEqual(
 			getSupportedThinkingLevels({ provider: "openai", id: "gpt-5", fullId: "openai/gpt-5", reasoning: true }),
-			["off", "minimal", "low", "medium", "high"],
+			["off", "minimal", "low", "medium", "high", "xhigh"],
 		);
 	});
 
@@ -38,7 +38,7 @@ describe("model info helpers", () => {
 				id: "xhigh-only",
 				fullId: "deepseek/xhigh-only",
 				reasoning: true,
-				thinkingLevelMap: { off: null, xhigh: "xhigh", max: null },
+				thinkingLevelMap: { off: null, xhigh: "xhigh" },
 			}),
 			["minimal", "low", "medium", "high", "xhigh"],
 		);

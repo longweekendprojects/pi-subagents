@@ -63,7 +63,7 @@ export function findModelInfo(model: string | undefined, availableModels: ModelI
 }
 
 export function getSupportedThinkingLevels(model: ModelInfo | undefined): ThinkingLevel[] {
-	const defaultLevels = THINKING_LEVELS.filter((level) => level !== "xhigh" && level !== "max");
+	const defaultLevels = THINKING_LEVELS.filter((level) => level !== "max");
 	if (!model) return defaultLevels;
 	if (model.reasoning === false) return ["off"];
 
