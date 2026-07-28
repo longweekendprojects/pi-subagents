@@ -67,10 +67,11 @@ export function getSupportedThinkingLevels(model: ModelInfo | undefined): Thinki
 	if (!model) return defaultLevels;
 	if (model.reasoning === false) return ["off"];
 
-	if (!model.thinkingLevelMap) return defaultLevels;
+	const thinkingLevelMap = model.thinkingLevelMap;
+	if (!thinkingLevelMap) return defaultLevels;
 
 	return THINKING_LEVELS.filter((level) => {
-		const mapped = model.thinkingLevelMap[level];
+		const mapped = thinkingLevelMap[level];
 		if (mapped === null) return false;
 		if (level === "xhigh" || level === "max") return mapped !== undefined;
 		return true;

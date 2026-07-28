@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.24.7] - 2026-07-28
+
+### Fixed
+- Fix strict TypeScript checking for model thinking-level metadata.
+
 ## [0.24.6] - 2026-07-27
 
 ### Added
