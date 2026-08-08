@@ -210,6 +210,8 @@ export interface WorkflowScriptTraceEntry {
 	durationMs?: number;
 	phase?: string;
 	label?: string;
+	/** Resolved child agent name, so status surfaces can name the agent rather than the caller's stable key. */
+	agent?: string;
 	error?: string;
 }
 
@@ -338,10 +340,11 @@ function validateKey(value: unknown, owner = "runs.run"): string {
 	return value;
 }
 
-function workflowStringMetadata(params: Record<string, unknown>): Pick<WorkflowScriptTraceEntry, "phase" | "label"> {
+function workflowStringMetadata(params: Record<string, unknown>): Pick<WorkflowScriptTraceEntry, "phase" | "label" | "agent"> {
 	return {
 		...(typeof params.phase === "string" && params.phase.trim() ? { phase: params.phase.trim() } : {}),
 		...(typeof params.label === "string" && params.label.trim() ? { label: params.label.trim() } : {}),
+		...(typeof params.agent === "string" && params.agent.trim() ? { agent: params.agent.trim() } : {}),
 	};
 }
 

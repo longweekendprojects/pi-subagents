@@ -4427,7 +4427,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 								if (entry.durationMs === undefined) delete existing.durationMs;
 								else existing.durationMs = entry.durationMs;
 							} else {
-								status.steps?.push({ agent: entry.key, label: entry.key, workflowKey: entry.key, parentWorkflowRunId: workflowRunId, status: mapped, startedAt: Date.now() });
+								status.steps?.push({ agent: entry.agent ?? entry.key, ...(entry.agent && entry.agent !== entry.key ? {} : { label: entry.key }), workflowKey: entry.key, parentWorkflowRunId: workflowRunId, status: mapped, startedAt: Date.now() });
 							}
 						}
 						projectWorkflowActivity();

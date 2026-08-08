@@ -1050,6 +1050,8 @@ export interface Details {
 			runId?: string;
 			phase?: string;
 			label?: string;
+			/** Resolved child agent name, so status surfaces can name the agent rather than the caller's stable key. */
+			agent?: string;
 			durationMs?: number;
 			error?: string;
 		}>;
