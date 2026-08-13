@@ -108,7 +108,7 @@ import { inspectSubagentStatus } from "../background/run-status.ts";
 import { applyForceTopLevelAsyncOverride } from "../background/top-level-async.ts";
 import { handleMissionAction, MISSION_ACTIONS } from "../../missions/actions.ts";
 import { attachMissionToLaunchResult, prepareMissionLaunch, writeMissionAsyncBinding, type MissionLaunchBinding } from "../../missions/lifecycle.ts";
-import { updateMission } from "../../missions/store.ts";
+import { MissionNotFoundError, updateMission } from "../../missions/store.ts";
 import type { MissionWorkflowChildUpdate } from "../../missions/types.ts";
 import { createMissionWorkflowState } from "../../missions/workflow-state.ts";
 import { resolveAuthorityDecision } from "../../policy/authority.ts";
@@ -4500,6 +4500,14 @@ function duplicateSubagentCallResult(params: SubagentParamsLike): AgentToolResul
 
 const workflowLaunchObservers = new WeakMap<object, (launch: { agent: string; sessionFile?: string; async: boolean; runId?: string }) => void>();
 
+/**
+ * Missions whose record is gone from disk. Terminal-mission retention prunes
+ * records while long-running children are still reporting, and every later
+ * heartbeat would otherwise re-throw and re-warn. Warning once per mission
+ * keeps the console (and the TUI it renders into) usable.
+ */
+const missionsMissingFromStore = new Set<string>();
+
 function recordMissionWorkflowChild(
 	binding: MissionLaunchBinding | undefined,
 	workflowRunId: string,
@@ -4507,10 +4515,17 @@ function recordMissionWorkflowChild(
 	update: Omit<MissionWorkflowChildUpdate, "workflowRunId" | "key">,
 ): void {
 	if (!binding) return;
+	if (missionsMissingFromStore.has(binding.missionId)) return;
 	const { task: _task, ...durableUpdate } = update;
 	try {
 		updateMission(binding.location, binding.missionId, { upsertWorkflowChildren: [{ workflowRunId, key, ...durableUpdate }] });
 	} catch (error) {
+		if (error instanceof MissionNotFoundError) {
+			// No later update can succeed, so stop trying instead of warning per heartbeat.
+			missionsMissingFromStore.add(binding.missionId);
+			console.warn(`[pi-subagents] Mission '${binding.missionId}' is no longer in the mission store; stopped recording its workflow children. Terminal-mission retention can prune a mission while its run is still active.`);
+			return;
+		}
 		console.warn(`[pi-subagents] Failed to record mission workflow child '${key}': ${error instanceof Error ? error.message : String(error)}`);
 	}
 }

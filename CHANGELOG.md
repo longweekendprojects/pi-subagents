@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- Warn once, instead of on every heartbeat, when a long-running workflow child outlives its mission record. Thanks to @albertgwo for #1079.
+
 ## [0.49.0] - 2026-08-13
 
 ### Added
