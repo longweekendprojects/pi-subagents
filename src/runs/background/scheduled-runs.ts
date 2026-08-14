@@ -239,8 +239,15 @@ class ScheduleStore {
 	}
 
 	get(id: string): ScheduleRecord {
+		const record = this.find(id);
+		if (!record) throw new Error(`Schedule '${id}' not found.`);
+		return record;
+	}
+
+	/** Like {@link get}, but returns undefined when the schedule no longer exists. */
+	find(id: string): ScheduleRecord | undefined {
 		const file = path.join(scheduleDir(this.root, id, false, this.projectCwd), "schedule.json");
-		if (!fs.existsSync(file)) throw new Error(`Schedule '${id}' not found.`);
+		if (!fs.existsSync(file)) return undefined;
 		return parseSchedule(readJson(file, "schedule record"), file);
 	}
 
@@ -600,14 +607,26 @@ export class ScheduledRunManager {
 		if (schedule.paused) return;
 		const next = nextRunAt(schedule);
 		if (next === undefined) return;
-		const timer = this.timersApi.setTimeout(() => void this.fire(store, schedule.id), Math.min(Math.max(0, next - this.now()), MAX_TIMER_DELAY_MS));
+		const timer = this.timersApi.setTimeout(() => {
+			// A timer callback is outside every caller's try/catch, so an escaping
+			// rejection here reaches the process as an uncaught exception and exits
+			// Pi. Contain every failure to this one schedule.
+			void this.fire(store, schedule.id).catch((error) => {
+				console.warn(`[pi-subagents] Scheduled run '${schedule.id}' failed to fire: ${error instanceof Error ? error.message : String(error)}`);
+			});
+		}, Math.min(Math.max(0, next - this.now()), MAX_TIMER_DELAY_MS));
 		timer.unref?.();
 		this.timers.set(this.timerKey(store, schedule.id), timer);
 	}
 
 	private async fire(store: ScheduleStore, id: string): Promise<void> {
 		this.clearTimer(store, id);
-		const schedule = store.get(id);
+		// Schedules are project-scoped and shared, and `delete` only clears the
+		// timer inside the deleting process. Another session can therefore remove
+		// a schedule while this process still holds an armed timer for it; there
+		// is then nothing to run and nothing to re-arm.
+		const schedule = store.find(id);
+		if (!schedule) return;
 		const planned = duePlannedAt(schedule, this.now());
 		if (planned === undefined || schedule.paused) return;
 		if (planned > this.now()) return this.arm(schedule, store);
