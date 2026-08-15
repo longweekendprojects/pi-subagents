@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- Stop a promotion race from deleting an already-promoted async result, and stop logging a failure when another session wins that race. Thanks to @albertgwo for #1130.
+
 ### Changed
 - Remove `prompts.render` from `workflowScript`; pass explicit task text to `runs.run` or use `/prompt-workflow` for reusable prompt templates.
 

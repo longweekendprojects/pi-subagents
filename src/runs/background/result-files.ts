@@ -198,11 +198,45 @@ export function promotePendingResultFile(resultsDir: string, sessionId: string, 
 	const pendingPath = resultPendingPath(resultsDir, sessionId, runId);
 	if (!existingResultFile(pendingPath)) return "none";
 	const resultPath = path.join(resultsDir, file);
+	// Concurrent sessions share this directory, so another watcher can promote the
+	// same pending file at any point below. Losing that race is expected; deleting
+	// the winner's promoted result is not.
+	const lostRace = (): "none" | "promoted" => {
+		if (existingResultFile(resultPath)) return "promoted";
+		if (options.logFailure !== false) console.error(`Pending async result '${pendingPath}' disappeared without a promoted result at '${resultPath}'.`);
+		return "none";
+	};
+	const finish = (): "promoted" | "pending" => existingResultFile(resultPath) ? "promoted" : "pending";
 	try {
-		fs.rmSync(resultPath, { force: true });
+		// Rename first. On POSIX this atomically replaces the destination, so a
+		// loser can never unlink the winner's freshly promoted result.
 		fs.renameSync(pendingPath, resultPath);
-		return existingResultFile(resultPath) ? "promoted" : "pending";
+		return finish();
 	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code === "ENOENT") return lostRace();
+		if (code === "EEXIST" || code === "EPERM" || code === "EACCES") {
+			// Windows refuses to rename onto an existing file. A destination under
+			// this run id is that run's published result, so another promoter already
+			// won. Never delete it to force our own copy in; drop the now-redundant
+			// pending file instead, which keeps this path non-destructive.
+			if (existingResultFile(resultPath)) {
+				try {
+					fs.rmSync(pendingPath, { force: true });
+				} catch (cleanupError) {
+					if (options.logFailure !== false) console.error(`Failed to clear redundant pending async result '${pendingPath}':`, cleanupError);
+				}
+				return "promoted";
+			}
+			try {
+				fs.renameSync(pendingPath, resultPath);
+				return finish();
+			} catch (retryError) {
+				if ((retryError as NodeJS.ErrnoException).code === "ENOENT") return lostRace();
+				if (options.logFailure !== false) console.error(`Failed to promote pending async result '${pendingPath}' to '${resultPath}':`, retryError);
+				return "pending";
+			}
+		}
 		if (options.logFailure !== false) console.error(`Failed to promote pending async result '${pendingPath}' to '${resultPath}':`, error);
 		return "pending";
 	}
