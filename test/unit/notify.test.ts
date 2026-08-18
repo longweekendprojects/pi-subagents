@@ -531,3 +531,42 @@ describe("completion formatting helpers", () => {
 		assert.equal(details.status, "completed");
 	});
 });
+
+describe("scheduled completions", () => {
+	// A schedule fires with nobody watching, so its completion has to be visible to
+	// the operator and attributable by the agent that receives it.
+	const scheduledResult = {
+		id: "run-1",
+		source: "async" as const,
+		agent: "workflow",
+		success: true,
+		summary: "Workflow completed with 1 child run(s).",
+		scheduleOrigin: { id: "45daa203", name: "authz-facts-efficacy" },
+	};
+
+	it("carries the schedule origin from the result into the notice", () => {
+		const details = buildCompletionDetails(scheduledResult);
+		assert.deepEqual(details.scheduleOrigin, { id: "45daa203", name: "authz-facts-efficacy" });
+		assert.match(formatSingleCompletion(details), /Scheduled run from \*\*authz-facts-efficacy\*\* \(schedule 45daa203\)\./);
+	});
+
+	it("round-trips the origin without absorbing it into the result preview", () => {
+		const parsed = parseSubagentNotifyContent(formatSingleCompletion(buildCompletionDetails(scheduledResult)));
+		assert.deepEqual(parsed?.scheduleOrigin, { id: "45daa203", name: "authz-facts-efficacy" });
+		assert.equal(parsed?.resultPreview, "Workflow completed with 1 child run(s).");
+	});
+
+	it("keeps attribution when a scheduled run is batched with other completions", () => {
+		const { scheduleOrigin: _origin, ...plain } = scheduledResult;
+		const grouped = formatGroupedCompletion([buildCompletionDetails({ ...plain, agent: "worker" }), buildCompletionDetails(scheduledResult)]);
+		assert.match(grouped, /2\. workflow — scheduled run from authz-facts-efficacy \(schedule 45daa203\)/);
+		assert.doesNotMatch(grouped, /1\. worker —/);
+	});
+
+	it("leaves an ordinary successful completion without an origin", () => {
+		const { scheduleOrigin: _origin, ...withoutSchedule } = scheduledResult;
+		const parsed = parseSubagentNotifyContent(formatSingleCompletion(buildCompletionDetails(withoutSchedule)));
+		assert.equal(parsed?.scheduleOrigin, undefined);
+		assert.equal(parsed?.resultPreview, "Workflow completed with 1 child run(s).");
+	});
+});

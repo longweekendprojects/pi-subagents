@@ -346,6 +346,9 @@ function executionParams(schedule: ScheduleRecord): SubagentParamsLike {
 		context: "fresh",
 		cwd: schedule.cwd,
 		mission: false,
+		// Nobody is watching a schedule the way they watch a run they just launched,
+		// so the completion has to say which schedule produced it.
+		scheduleOrigin: { id: schedule.id, ...(schedule.name ? { name: schedule.name } : {}) },
 		...(schedule.timeoutMs === undefined ? {} : { timeoutMs: schedule.timeoutMs }),
 	};
 }

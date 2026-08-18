@@ -27,6 +27,8 @@ export interface SubagentNotifyDetails {
 	sessionLabel?: string;
 	sessionValue?: string;
 	handoffPath?: string;
+	/** Present when a durable schedule launched the run. */
+	scheduleOrigin?: { id: string; name?: string };
 }
 
 export interface CompletionNotification {
@@ -94,9 +96,14 @@ function formatSessionLine(details: SubagentNotifyDetails): string | undefined {
 export function formatSingleCompletion(details: SubagentNotifyDetails): string {
 	const sessionLine = formatSessionLine(details);
 	const taskKind = details.source === "foreground" ? "Detached foreground task" : "Background task";
+	const scheduleLine = details.scheduleOrigin
+		? `Scheduled run from **${details.scheduleOrigin.name ?? details.scheduleOrigin.id}** (schedule ${details.scheduleOrigin.id}).`
+		: undefined;
 	return [
 		`${taskKind} ${details.status}: **${details.agent}**${details.taskInfo ?? ""}`,
 		"",
+		scheduleLine,
+		scheduleLine ? "" : undefined,
 		details.resultPreview.trim() ? details.resultPreview : "(no output)",
 		details.handoffPath ? "" : undefined,
 		details.handoffPath ? `Parallel handoff: ${details.handoffPath}` : undefined,
@@ -111,7 +118,17 @@ export function parseSubagentNotifyContent(content: string): SubagentNotifyDetai
 	const lines = content.split("\n");
 	const match = (lines[0] ?? "").match(/^(Background task|Detached foreground task) (completed|failed|paused|stopped): \*\*(.+?)\*\*(?:\s+(\([^)]*\)))?$/);
 	if (!match) return undefined;
-	const body = lines.slice(2);
+	let body = lines.slice(2);
+	// Restore the schedule origin so a re-rendered notice keeps its attribution and
+	// does not fold the line into the result preview.
+	const scheduleMatch = (body[0] ?? "").match(/^Scheduled run from \*\*(.+?)\*\* \(schedule (.+?)\)\.$/);
+	let parsedScheduleOrigin: { id: string; name?: string } | undefined;
+	if (scheduleMatch) {
+		const label = scheduleMatch[1]!;
+		const id = scheduleMatch[2]!;
+		parsedScheduleOrigin = { id, ...(label === id ? {} : { name: label }) };
+		body = body.slice(body[1]?.trim() === "" ? 2 : 1);
+	}
 	let sessionIndex = -1;
 	for (let i = body.length - 1; i >= 1; i--) {
 		if (body[i - 1]?.trim() === "" && /^(Session|Session file|Session share error):\s+/.test(body[i]!)) {
@@ -138,6 +155,7 @@ export function parseSubagentNotifyContent(content: string): SubagentNotifyDetai
 		status: match[2] as SubagentNotifyDetails["status"],
 		...(match[1] === "Detached foreground task" ? { source: "foreground" as const } : {}),
 		...(match[4] ? { taskInfo: match[4] } : {}),
+		...(parsedScheduleOrigin ? { scheduleOrigin: parsedScheduleOrigin } : {}),
 		resultPreview,
 		...(handoffPath ? { handoffPath } : {}),
 		...(sessionLabel && sessionValue ? { sessionLabel, sessionValue } : {}),
@@ -151,7 +169,7 @@ export function formatGroupedCompletion(details: SubagentNotifyDetails[]): strin
 		const detail = details[index];
 		if (!detail) continue;
 		const sessionLine = formatSessionLine(detail);
-		blocks.push(`${index + 1}. ${detail.agent}${detail.taskInfo ?? ""}`);
+		blocks.push(`${index + 1}. ${detail.agent}${detail.taskInfo ?? ""}${detail.scheduleOrigin ? ` — scheduled run from ${detail.scheduleOrigin.name ?? detail.scheduleOrigin.id} (schedule ${detail.scheduleOrigin.id})` : ""}`);
 		blocks.push(detail.resultPreview.trim() ? detail.resultPreview : "(no output)");
 		if (detail.handoffPath) blocks.push(`Parallel handoff: ${detail.handoffPath}`);
 		if (sessionLine) blocks.push(sessionLine);
@@ -171,7 +189,7 @@ function sendCompletion(pi: Pick<ExtensionAPI, "sendMessage">, items: PendingCom
 	if (items.length === 0) return true;
 	const details = items.map((item) => item.details);
 	const content = details.length === 1 ? formatSingleCompletion(details[0]!) : formatGroupedCompletion(details);
-	const display = details.some((detail) => detail.source === "foreground" || detail.status !== "completed");
+	const display = details.some((detail) => detail.source === "foreground" || detail.status !== "completed" || detail.scheduleOrigin !== undefined);
 	try {
 		pi.sendMessage(
 			{
@@ -226,9 +244,17 @@ export function buildCompletionDetails(result: CompletionNotification): Subagent
 				: result.sessionFile
 					? { label: "Session file", value: result.sessionFile }
 					: undefined;
+	const scheduleOriginRaw = result.scheduleOrigin;
+	const scheduleOrigin = scheduleOriginRaw && typeof scheduleOriginRaw === "object" && typeof (scheduleOriginRaw as { id?: unknown }).id === "string"
+		? {
+			id: (scheduleOriginRaw as { id: string }).id,
+			...(typeof (scheduleOriginRaw as { name?: unknown }).name === "string" ? { name: (scheduleOriginRaw as { name: string }).name } : {}),
+		}
+		: undefined;
 	return {
 		agent,
 		status,
+		...(scheduleOrigin ? { scheduleOrigin } : {}),
 		...(result.source ? { source: result.source } : {}),
 		...(taskInfo ? { taskInfo } : {}),
 		resultPreview: summary,

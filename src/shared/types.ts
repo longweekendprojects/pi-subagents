@@ -409,6 +409,12 @@ export type ProcessTerminalV1 =
 		diagnostic?: string;
 	});
 
+/** Identifies the durable schedule that launched a run, so its completion is attributable. */
+export interface ScheduleOrigin {
+	id: string;
+	name?: string;
+}
+
 export type SteeringActionState = "delivered" | "scheduled" | "pending" | "partial" | "recovered" | "failed";
 export type SteeringTargetState = "scheduled" | "pending" | "routed" | "queued" | "delivered" | "late" | "failed" | "recovered";
 
@@ -1408,6 +1414,8 @@ export interface AsyncStatus {
 	workflow?: Details["workflow"];
 	parentWorkflowRunId?: string;
 	workflowKey?: string;
+	/** Set when a durable schedule launched this run, so completions can name their origin. */
+	scheduleOrigin?: ScheduleOrigin;
 	steps?: Array<{
 		agent: string;
 		runner?: ExternalCliRunnerStatus | ExternalJobRunnerStatus;
