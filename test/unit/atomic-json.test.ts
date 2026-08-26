@@ -13,6 +13,8 @@ class FakeFs {
 	events: string[] = [];
 	nextDescriptor = 1;
 	descriptorPaths = new Map<number, string>();
+	descriptorFlags = new Map<number, string>();
+	failReadOnlyFileFsync = false;
 	failFsyncAt: number | undefined;
 	failFsyncCodeAt: { call: number; code: string } | undefined;
 	fsyncCalls = 0;
@@ -57,10 +59,11 @@ class FakeFs {
 		this.files.set(targetPath, contents);
 	}
 
-	openSync(filePath: string): number {
-		this.events.push(`open:${filePath}`);
+	openSync(filePath: string, flags = "r"): number {
+		this.events.push(`open:${filePath}:${flags}`);
 		const descriptor = this.nextDescriptor++;
 		this.descriptorPaths.set(descriptor, filePath);
+		this.descriptorFlags.set(descriptor, flags);
 		return descriptor;
 	}
 
@@ -68,6 +71,11 @@ class FakeFs {
 		const filePath = this.descriptorPaths.get(descriptor) ?? "unknown";
 		this.events.push(`fsync:${filePath}`);
 		this.fsyncCalls++;
+		if (this.failReadOnlyFileFsync && this.files.has(filePath) && this.descriptorFlags.get(descriptor) === "r") {
+			const error = new Error(`read-only fsync failed for ${filePath}`) as NodeJS.ErrnoException;
+			error.code = "EPERM";
+			throw error;
+		}
 		if (this.failFsyncCodeAt?.call === this.fsyncCalls) {
 			const error = new Error(`fsync failed for ${filePath}`) as NodeJS.ErrnoException;
 			error.code = this.failFsyncCodeAt.code;
@@ -79,6 +87,7 @@ class FakeFs {
 	closeSync(descriptor: number): void {
 		this.events.push(`close:${this.descriptorPaths.get(descriptor) ?? "unknown"}`);
 		this.descriptorPaths.delete(descriptor);
+		this.descriptorFlags.delete(descriptor);
 	}
 
 	rmSync(filePath: string): void {
@@ -186,6 +195,7 @@ describe("writeAtomicJson", () => {
 	it("tolerates unsupported Windows directory fsync without hiding file fsync failures", () => {
 		const targetPath = path.join("/tmp", "durable-windows.json");
 		const directoryFailure = new FakeFs();
+		directoryFailure.failReadOnlyFileFsync = true;
 		directoryFailure.failFsyncCodeAt = { call: 2, code: "EPERM" };
 		const writeWithUnsupportedDirectorySync = createAtomicJsonWriter({
 			fs: directoryFailure as any,

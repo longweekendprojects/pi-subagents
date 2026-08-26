@@ -46,11 +46,11 @@ function tempBaseName(filePath: string, pid: number, nowMs: number, randomId: st
 }
 
 /** Sync one path without allowing descriptor cleanup to hide the sync failure. */
-function syncPath(fsImpl: AtomicJsonFs, targetPath: string): void {
+function syncPath(fsImpl: AtomicJsonFs, targetPath: string, flags: "r" | "r+" = "r"): void {
 	let descriptor: number | undefined;
 	let operationError: unknown;
 	try {
-		descriptor = fsImpl.openSync(targetPath, "r");
+		descriptor = fsImpl.openSync(targetPath, flags);
 		fsImpl.fsyncSync(descriptor);
 	} catch (error) {
 		operationError = error;
@@ -116,7 +116,7 @@ function restoreDestinationPreimage(input: {
 			input.preimage.content,
 			input.mode === undefined ? "utf-8" : { encoding: "utf-8", mode: input.mode },
 		);
-		syncPath(input.fsImpl, rollbackTempPath);
+		syncPath(input.fsImpl, rollbackTempPath, "r+");
 		renameWithRetry(input.fsImpl, rollbackTempPath, input.filePath, input.retryDelaysMs, input.wait);
 		syncDirectoryPath(input.fsImpl, path.dirname(input.filePath), input.platform);
 	} catch {
@@ -160,7 +160,7 @@ export function createAtomicJsonWriter(options: AtomicJsonWriterOptions = {}): (
 		let writeError: unknown;
 		try {
 			fsImpl.writeFileSync(tempPath, JSON.stringify(payload, null, 2), mode === undefined ? "utf-8" : { encoding: "utf-8", mode });
-			if (durable) syncPath(fsImpl, tempPath);
+			if (durable) syncPath(fsImpl, tempPath, "r+");
 			renameWithRetry(fsImpl, tempPath, filePath, renameRetryDelaysMs, wait);
 			renamed = true;
 			if (durable) syncDirectoryPath(fsImpl, path.dirname(filePath), platform);
