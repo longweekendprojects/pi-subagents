@@ -93,6 +93,22 @@ describe("review checkpoints", () => {
 				checkpointSatisfied: false,
 				permanentFinalization: false,
 			});
+			persistReviewCheckpointGateState({
+				storePath,
+				identity,
+				assistantTurn: 3,
+				permanentFinalization: true,
+				finalizationAbortDelivered: true,
+			});
+			persistReviewCheckpointGateState({
+				storePath,
+				identity,
+				assistantTurn: 3,
+				finalizationSteerDelivered: true,
+			});
+			const delivered = readReviewCheckpointStoreState(storePath, identity);
+			assert.equal(delivered.finalizationAbortDelivered, true);
+			assert.equal(delivered.finalizationSteerDelivered, true);
 			persistReviewCheckpoint({
 				storePath,
 				identity,
@@ -103,6 +119,8 @@ describe("review checkpoints", () => {
 			assert.equal(recovered.assistantTurn, 3);
 			assert.equal(recovered.checkpointSatisfied, true);
 			assert.equal(recovered.permanentFinalization, true);
+			assert.equal(recovered.finalizationAbortDelivered, true);
+			assert.equal(recovered.finalizationSteerDelivered, true);
 			assert.equal(recovered.records.at(-1)?.submission.kind, "final");
 			assert.throws(() => persistReviewCheckpoint({
 				storePath,

@@ -296,10 +296,13 @@ describe("subagent prompt runtime", () => {
 			let checkpointTool: { execute: (_id: string, params: { value: unknown }) => Promise<unknown> } | undefined;
 			const sent: Array<{ content: string; deliverAs?: string }> = [];
 			let aborts = 0;
-			const ctx = { abort() { aborts += 1; } };
+			const ctx = { abort() { aborts += 1; }, hasUI: true };
 			registerSubagentPromptRuntime({
 				on(event: string, handler: (event?: { toolName?: string; input?: unknown }, runtimeCtx?: { abort(): void }) => unknown) {
 					handlers.set(event, [...(handlers.get(event) ?? []), handler]);
+				},
+				getAllTools() {
+					return [];
 				},
 				registerTool(tool: { name: string; execute: (_id: string, params: { value: unknown }) => Promise<unknown> }) {
 					if (tool.name === REVIEW_CHECKPOINT_TOOL_NAME) checkpointTool = tool;
@@ -325,18 +328,111 @@ describe("subagent prompt runtime", () => {
 			assert.equal(sent.length, 1, "finalization sends exactly one steering message");
 			assert.equal(sent[0]?.deliverAs, "steer");
 			assert.match(sent[0]?.content ?? "", /checkpoint every confirmed finding.*final status.*final response/i);
-			assert.equal(readReviewCheckpointStoreState(storePath, { runId: "finalize-run", agent: "reviewer", childIndex: 0 }).permanentFinalization, true);
+			const deliveredState = readReviewCheckpointStoreState(storePath, { runId: "finalize-run", agent: "reviewer", childIndex: 0 });
+			assert.equal(deliveredState.permanentFinalization, true);
+			assert.equal(deliveredState.finalizationAbortDelivered, true);
+			assert.equal(deliveredState.finalizationSteerDelivered, true);
 			assert.equal(await blocked("read"), true, "permanent finalization blocks investigation");
 			assert.equal(await blocked("structured_output"), false, "active structured output remains allowed");
 			assert.equal(await blocked(REVIEW_CHECKPOINT_TOOL_NAME, { value: { kind: "final", status: "complete" } }), false, "the final checkpoint remains retryable after the latch");
+
+			await emit("agent_end");
+			const replacementHandlers = new Map<string, Array<(event?: object, runtimeCtx?: { abort(): void }) => unknown>>();
+			let replacementAborts = 0;
+			const replacementMessages: string[] = [];
+			registerSubagentPromptRuntime({
+				on(event: string, handler: (event?: object, runtimeCtx?: { abort(): void }) => unknown) {
+					replacementHandlers.set(event, [...(replacementHandlers.get(event) ?? []), handler]);
+				},
+				getAllTools() {
+					return [];
+				},
+				registerTool() {},
+				sendUserMessage(content: string) {
+					replacementMessages.push(content);
+				},
+			} as never);
+			await Promise.all((replacementHandlers.get("agent_start") ?? []).map((handler) => handler({}, { abort() { replacementAborts += 1; } })));
+			await new Promise((resolve) => setTimeout(resolve, 40));
+			assert.equal(replacementAborts, 0, "durable delivery state suppresses a duplicate abort after restart");
+			assert.equal(replacementMessages.length, 0, "durable delivery state suppresses duplicate steering after restart");
+
 			assert.ok(checkpointTool, "review_checkpoint must register");
 			await checkpointTool.execute("final", { value: { kind: "final", status: "complete" } });
 			assert.equal(readReviewCheckpointStoreState(storePath, { runId: "finalize-run", agent: "reviewer", childIndex: 0 }).records.at(-1)?.submission.kind, "final");
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("retries failed finalization persistence and side effects without duplicating successful delivery", async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "subagent-review-finalize-retry-"));
+		try {
+			const blockedParent = path.join(dir, "blocked");
+			fs.writeFileSync(blockedParent, "not a directory", "utf-8");
+			const storePath = path.join(blockedParent, "checkpoint.json");
+			process.env[REVIEW_CHECKPOINT_POLICY_ENV] = JSON.stringify({ version: 1 });
+			process.env[REVIEW_CHECKPOINT_STORE_ENV] = storePath;
+			process.env[REVIEW_CHECKPOINT_FINALIZE_AT_ENV] = String(Date.now() + 25);
+			process.env[SUBAGENT_RUN_ID_ENV] = "finalize-retry-run";
+			process.env[SUBAGENT_CHILD_AGENT_ENV] = "reviewer";
+			process.env[SUBAGENT_CHILD_INDEX_ENV] = "0";
+			const handlers = new Map<string, Array<(event?: { toolName?: string; input?: unknown }, ctx?: { abort(): void }) => unknown>>();
+			let abortAttempts = 0;
+			let steeringAttempts = 0;
+			const deliveredMessages: string[] = [];
+			const ctx = {
+				abort() {
+					abortAttempts += 1;
+					if (abortAttempts === 1) throw new Error("transient abort failure");
+				},
+				hasUI: true,
+			};
+			registerSubagentPromptRuntime({
+				on(event: string, handler: (event?: { toolName?: string; input?: unknown }, runtimeCtx?: { abort(): void }) => unknown) {
+					handlers.set(event, [...(handlers.get(event) ?? []), handler]);
+				},
+				getAllTools() {
+					return [];
+				},
+				registerTool() {},
+				sendUserMessage(content: string) {
+					steeringAttempts += 1;
+					if (steeringAttempts === 1) throw new Error("transient steering failure");
+					deliveredMessages.push(content);
+				},
+			} as never);
+			const emit = async (event: string, payload: { toolName?: string; input?: unknown } = {}): Promise<unknown[]> => Promise.all(
+				(handlers.get(event) ?? []).map((handler) => handler(payload, ctx)),
+			);
 
 			await emit("agent_start");
-			await new Promise((resolve) => setTimeout(resolve, 40));
-			assert.equal(aborts, 1, "a durable final checkpoint clears later timer work");
-			assert.equal(sent.length, 1, "a durable final checkpoint does not resend steering");
+			await new Promise((resolve) => setTimeout(resolve, 80));
+			assert.equal(abortAttempts, 0, "side effects wait for the permanent latch to persist");
+			assert.equal(steeringAttempts, 0, "steering waits for the permanent latch to persist");
+			fs.rmSync(blockedParent, { force: true });
+			fs.mkdirSync(blockedParent);
+
+			const deliveryDeadline = Date.now() + 2_000;
+			while (deliveredMessages.length === 0 && Date.now() < deliveryDeadline) {
+				await new Promise((resolve) => setTimeout(resolve, 25));
+			}
+			assert.equal(abortAttempts, 2, "a failed abort is retried once");
+			assert.equal(steeringAttempts, 2, "a failed steering send is retried once");
+			assert.equal(deliveredMessages.length, 1, "successful steering is not duplicated");
+			const state = readReviewCheckpointStoreState(storePath, { runId: "finalize-retry-run", agent: "reviewer", childIndex: 0 });
+			assert.equal(state.permanentFinalization, true);
+			assert.equal(state.finalizationAbortDelivered, true);
+			assert.equal(state.finalizationSteerDelivered, true);
+			const investigation = await emit("tool_call", { toolName: "read" });
+			assert.equal(investigation.some((decision) => (decision as { block?: boolean } | undefined)?.block === true), true);
+			const checkpoint = await emit("tool_call", { toolName: REVIEW_CHECKPOINT_TOOL_NAME, input: { value: { kind: "final", status: "complete" } } });
+			assert.equal(checkpoint.some((decision) => (decision as { block?: boolean } | undefined)?.block === true), false);
+
+			await emit("agent_end");
+			await new Promise((resolve) => setTimeout(resolve, 300));
+			assert.equal(abortAttempts, 2, "agent_end clears retry timers");
+			assert.equal(steeringAttempts, 2, "agent_end clears steering retries");
 		} finally {
 			fs.rmSync(dir, { recursive: true, force: true });
 		}

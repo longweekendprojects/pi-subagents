@@ -157,6 +157,9 @@ export interface ReviewCheckpointGateState {
 	assistantTurn: number;
 	checkpointSatisfied: boolean;
 	permanentFinalization: boolean;
+	/** Proactive finalization side effects that completed and must not repeat after restart. */
+	finalizationAbortDelivered?: boolean;
+	finalizationSteerDelivered?: boolean;
 }
 
 export type ReviewCheckpointEvidenceState = "missing" | "incomplete" | "complete" | "truncated";

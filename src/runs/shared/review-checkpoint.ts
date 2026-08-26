@@ -131,6 +131,8 @@ interface ReviewCheckpointStore {
 	assistantTurn?: number;
 	checkpointSatisfied?: boolean;
 	permanentFinalization?: boolean;
+	finalizationAbortDelivered?: boolean;
+	finalizationSteerDelivered?: boolean;
 }
 
 interface ReviewCheckpointAcknowledgement {
@@ -331,6 +333,8 @@ function gateStateFromStore(store: ReviewCheckpointStore): ReviewCheckpointGateS
 		assistantTurn: Math.max(recordedTurn, store.assistantTurn ?? 0),
 		checkpointSatisfied: store.checkpointSatisfied === true || records.length > 0,
 		permanentFinalization: store.permanentFinalization === true || recordedFinal,
+		...(store.finalizationAbortDelivered === true ? { finalizationAbortDelivered: true } : {}),
+		...(store.finalizationSteerDelivered === true ? { finalizationSteerDelivered: true } : {}),
 	};
 }
 
@@ -373,7 +377,9 @@ function readStoreFile(filePath: string, identity?: ReviewCheckpointIdentity): R
 	if ((value.generation !== undefined && !validGeneration(value.generation))
 		|| (value.assistantTurn !== undefined && (!Number.isInteger(value.assistantTurn) || (value.assistantTurn as number) < 0))
 		|| (value.checkpointSatisfied !== undefined && typeof value.checkpointSatisfied !== "boolean")
-		|| (value.permanentFinalization !== undefined && typeof value.permanentFinalization !== "boolean")) {
+		|| (value.permanentFinalization !== undefined && typeof value.permanentFinalization !== "boolean")
+		|| (value.finalizationAbortDelivered !== undefined && typeof value.finalizationAbortDelivered !== "boolean")
+		|| (value.finalizationSteerDelivered !== undefined && typeof value.finalizationSteerDelivered !== "boolean")) {
 		return invalidStoreFile();
 	}
 	const records = value.records.map((record) => validateReviewCheckpointRecord(record, identity));
@@ -385,6 +391,8 @@ function readStoreFile(filePath: string, identity?: ReviewCheckpointIdentity): R
 		...(value.assistantTurn !== undefined ? { assistantTurn: value.assistantTurn as number } : {}),
 		...(value.checkpointSatisfied !== undefined ? { checkpointSatisfied: value.checkpointSatisfied as boolean } : {}),
 		...(value.permanentFinalization !== undefined ? { permanentFinalization: value.permanentFinalization as boolean } : {}),
+		...(value.finalizationAbortDelivered !== undefined ? { finalizationAbortDelivered: value.finalizationAbortDelivered as boolean } : {}),
+		...(value.finalizationSteerDelivered !== undefined ? { finalizationSteerDelivered: value.finalizationSteerDelivered as boolean } : {}),
 	};
 	const acknowledged = store.generation === undefined || readAcknowledgement(filePath) === store.generation;
 	return {
@@ -411,6 +419,12 @@ function mergedStoreState(primary: ReadStoreFile, previous: ReadStoreFile): Revi
 		assistantTurn: Math.max(acknowledgedPrimary.gateState.assistantTurn, acknowledgedPrevious.gateState.assistantTurn, derived.assistantTurn),
 		checkpointSatisfied: acknowledgedPrimary.gateState.checkpointSatisfied || acknowledgedPrevious.gateState.checkpointSatisfied || derived.checkpointSatisfied,
 		permanentFinalization: acknowledgedPrimary.gateState.permanentFinalization || acknowledgedPrevious.gateState.permanentFinalization || derived.permanentFinalization,
+		...(acknowledgedPrimary.gateState.finalizationAbortDelivered || acknowledgedPrevious.gateState.finalizationAbortDelivered
+			? { finalizationAbortDelivered: true }
+			: {}),
+		...(acknowledgedPrimary.gateState.finalizationSteerDelivered || acknowledgedPrevious.gateState.finalizationSteerDelivered
+			? { finalizationSteerDelivered: true }
+			: {}),
 	};
 }
 
@@ -445,6 +459,8 @@ function recordStore(records: ReviewCheckpointRecord[], gateState: ReviewCheckpo
 		assistantTurn: gateState.assistantTurn,
 		checkpointSatisfied: gateState.checkpointSatisfied,
 		permanentFinalization: gateState.permanentFinalization,
+		...(gateState.finalizationAbortDelivered ? { finalizationAbortDelivered: true } : {}),
+		...(gateState.finalizationSteerDelivered ? { finalizationSteerDelivered: true } : {}),
 	};
 }
 
@@ -470,7 +486,15 @@ function persistStoreTransition(input: {
 	const hadPriorSnapshot = primary.records.length > 0
 		|| previous.records.length > 0
 		|| primary.gateState.assistantTurn > 0
-		|| previous.gateState.assistantTurn > 0;
+		|| previous.gateState.assistantTurn > 0
+		|| primary.gateState.checkpointSatisfied
+		|| previous.gateState.checkpointSatisfied
+		|| primary.gateState.permanentFinalization
+		|| previous.gateState.permanentFinalization
+		|| primary.gateState.finalizationAbortDelivered === true
+		|| previous.gateState.finalizationAbortDelivered === true
+		|| primary.gateState.finalizationSteerDelivered === true
+		|| previous.gateState.finalizationSteerDelivered === true;
 	if (hadPriorSnapshot) {
 		persistAcknowledgedStore(`${input.storePath}.previous`, input.current.records, input.current);
 	}
@@ -484,6 +508,8 @@ export function persistReviewCheckpointGateState(input: {
 	assistantTurn: number;
 	checkpointSatisfied?: boolean;
 	permanentFinalization?: boolean;
+	finalizationAbortDelivered?: boolean;
+	finalizationSteerDelivered?: boolean;
 }): ReviewCheckpointGateState {
 	if (!input.storePath.trim()) throw new Error("review checkpoint store path is required.");
 	if (!Number.isInteger(input.assistantTurn) || input.assistantTurn < 0) throw new Error("review checkpoint assistant turn is invalid.");
@@ -493,12 +519,20 @@ export function persistReviewCheckpointGateState(input: {
 		assistantTurn: Math.max(persisted.current.assistantTurn, input.assistantTurn),
 		checkpointSatisfied: persisted.current.checkpointSatisfied || input.checkpointSatisfied === true,
 		permanentFinalization: persisted.current.permanentFinalization || input.permanentFinalization === true,
+		...(persisted.current.finalizationAbortDelivered || input.finalizationAbortDelivered === true
+			? { finalizationAbortDelivered: true }
+			: {}),
+		...(persisted.current.finalizationSteerDelivered || input.finalizationSteerDelivered === true
+			? { finalizationSteerDelivered: true }
+			: {}),
 	};
 	persistStoreTransition({ ...persisted, storePath: input.storePath, next });
 	return {
 		assistantTurn: next.assistantTurn,
 		checkpointSatisfied: next.checkpointSatisfied,
 		permanentFinalization: next.permanentFinalization,
+		...(next.finalizationAbortDelivered ? { finalizationAbortDelivered: true } : {}),
+		...(next.finalizationSteerDelivered ? { finalizationSteerDelivered: true } : {}),
 	};
 }
 
@@ -537,6 +571,8 @@ export function persistReviewCheckpoint(input: {
 		checkpointSatisfied: true,
 		// A proactive finalization latch remains durable while final receipts retry.
 		permanentFinalization: persisted.current.permanentFinalization || submission.kind === "final",
+		...(persisted.current.finalizationAbortDelivered ? { finalizationAbortDelivered: true } : {}),
+		...(persisted.current.finalizationSteerDelivered ? { finalizationSteerDelivered: true } : {}),
 	};
 	persistStoreTransition({ ...persisted, storePath: input.storePath, next });
 	return record;
