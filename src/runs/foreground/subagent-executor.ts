@@ -67,7 +67,7 @@ import { currentCompletionOwnerId } from "../../shared/completion-owner.ts";
 import { applyIntercomBridgeToAgent, INTERCOM_BRIDGE_MARKER, resolveIntercomBridge, resolveIntercomSessionTarget, resolveSubagentIntercomTarget, type IntercomBridgeState } from "../../intercom/intercom-bridge.ts";
 import { formatControlIntercomMessage, formatControlNoticeMessage, resolveControlConfig, shouldNotifyControlEvent } from "../shared/subagent-control.ts";
 import { resolveTurnBudgetConfig } from "../shared/turn-budget.ts";
-import { validateCheckpointPolicy } from "../shared/review-checkpoint.ts";
+import { REVIEW_CHECKPOINT_COLLECTION_RESERVE_MS, validateCheckpointPolicy } from "../shared/review-checkpoint.ts";
 import { formatSpawnBudget, getSpawnBudgetSnapshot, grantSpawnBudget, preflightSpawnBudget, preflightSpawnBudgetGrant, reserveSpawnBudget } from "../shared/spawn-budget.ts";
 import { claimRunFanoutBatch, claimRunFanoutBatchWithCommit, createRunFanoutBudget, decodeRunFanoutBudgetDescriptor, formatRunFanoutBudget, getRunFanoutBudgetSnapshot, readRunFanoutBudgetDescriptor, RunFanoutLimitError, RUN_FANOUT_BUDGET_ENV, writeRunFanoutBudgetDescriptor } from "../shared/run-fanout-budget.ts";
 import { validateToolBudgetConfig } from "../shared/tool-budget.ts";
@@ -2260,15 +2260,16 @@ function buildRequestedModeError(params: SubagentParamsLike, message: string): A
 	);
 }
 
-function applySingleAgentLaunchDefaults(params: SubagentParamsLike, agents: AgentConfig[]): SubagentParamsLike {
-	if ((params.chain?.length ?? 0) > 0 || (params.tasks?.length ?? 0) > 0 || !params.agent) return params;
+export function applySingleAgentLaunchDefaults(params: SubagentParamsLike, agents: AgentConfig[]): { params?: SubagentParamsLike; error?: string } {
+	if ((params.chain?.length ?? 0) > 0 || (params.tasks?.length ?? 0) > 0 || !params.agent) return { params };
 	const agent = agents.find((candidate) => candidate.name === params.agent);
-	if (!agent) return params;
+	if (!agent) return { params };
 	const parentDefault = params.workflowParentTimeoutDefault === true;
 	const requestedTimeout = parentDefault
 		? agent.defaultTimeoutMs
 		: params.timeoutMs ?? params.maxRuntimeMs ?? agent.defaultTimeoutMs;
 	const clamped = clampWorkflowChildTimeout(requestedTimeout, params.workflowParentDeadlineAt);
+	if (clamped.error) return { error: clamped.error };
 	const { workflowParentTimeoutDefault: _workflowParentTimeoutDefault, ...withoutMarker } = params;
 	const withoutInternalTimeout = params.workflowParentDeadlineAt === undefined
 		? withoutMarker
@@ -2277,15 +2278,17 @@ function applySingleAgentLaunchDefaults(params: SubagentParamsLike, agents: Agen
 			return withoutAlias;
 		})();
 	return {
-		...withoutInternalTimeout,
-		...(params.async === undefined && agent.defaultAsync !== undefined ? { async: agent.defaultAsync } : {}),
-		...(clamped.timeoutMs !== undefined ? { timeoutMs: clamped.timeoutMs } : {}),
-		...(params.turnBudget === undefined && agent.defaultTurnBudget !== undefined
-			? { turnBudget: agent.defaultTurnBudget }
-			: {}),
-		...(params.acceptance === undefined && agent.defaultAcceptance !== undefined
-			? { acceptance: agent.defaultAcceptance }
-			: {}),
+		params: {
+			...withoutInternalTimeout,
+			...(params.async === undefined && agent.defaultAsync !== undefined ? { async: agent.defaultAsync } : {}),
+			...(clamped.timeoutMs !== undefined ? { timeoutMs: clamped.timeoutMs } : {}),
+			...(params.turnBudget === undefined && agent.defaultTurnBudget !== undefined
+				? { turnBudget: agent.defaultTurnBudget }
+				: {}),
+			...(params.acceptance === undefined && agent.defaultAcceptance !== undefined
+				? { acceptance: agent.defaultAcceptance }
+				: {}),
+		},
 	};
 }
 
@@ -3007,6 +3010,16 @@ function prepareWorkflowChildLaunchParams(input: {
 	return prepareWorkflowLaunchParams(input.workflowDefaults, childParams, input.parentWorkflowRunId, input.workflowKey, input.options);
 }
 
+/** Rejects an expired child interval before workflow admission mutates fan-out or capacity state. */
+function preflightWorkflowChildLaunch(input: Parameters<typeof prepareWorkflowChildLaunchParams>[0]): void {
+	const params = prepareWorkflowChildLaunchParams(input);
+	if (!params.agent || params.action === "resume") return;
+	const childCwd = typeof params.cwd === "string" ? resolveChildCwd(input.workflowCwd, params.cwd) : input.workflowCwd;
+	const scope = resolveExecutionAgentScope(params.agentScope ?? input.workflowAgentScope);
+	const defaults = applySingleAgentLaunchDefaults(params, input.discoverAgents(childCwd, scope).agents);
+	if (defaults.error) throw new Error(defaults.error);
+}
+
 function finalizeSingleWorktreeHandoff(input: {
 	worktreeSetup: WorktreeSetup;
 	artifactsDir: string;
@@ -3606,19 +3619,18 @@ export async function steerWorkflowChildByKey(input: {
 	}
 }
 
-export const WORKFLOW_CHILD_DEADLINE_RESERVE_MS = 1;
-
-/** Keeps every workflow child deadline strictly inside its parent deadline. */
+/** Keeps every workflow child deadline inside the parent collection reserve. */
 export function clampWorkflowChildTimeout(
 	requestedTimeoutMs: unknown,
 	parentDeadlineAt: number | undefined,
 	now = Date.now(),
+	collectionReserveMs = REVIEW_CHECKPOINT_COLLECTION_RESERVE_MS,
 ): { timeoutMs?: number; error?: string } {
 	if (parentDeadlineAt === undefined) {
 		return typeof requestedTimeoutMs === "number" ? { timeoutMs: requestedTimeoutMs } : {};
 	}
-	const available = Math.floor(parentDeadlineAt - now) - WORKFLOW_CHILD_DEADLINE_RESERVE_MS;
-	if (available <= 0) return { error: "Workflow deadline expired before a child could launch." };
+	const available = Math.floor(parentDeadlineAt - now) - collectionReserveMs;
+	if (available <= 0) return { error: "Workflow deadline leaves no positive child interval after the 60000ms collection reserve." };
 	if (requestedTimeoutMs === undefined) return { timeoutMs: available };
 	if (typeof requestedTimeoutMs !== "number") return {};
 	return { timeoutMs: Math.min(requestedTimeoutMs, available) };
@@ -4131,6 +4143,9 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 							...(workflowState ? { state: workflowState } : {}),
 							onTrace: updateTrace,
 							admit: (calls) => {
+								for (const { key, params: childParams } of calls) {
+									preflightWorkflowChildLaunch({ workflowDefaults: workflowChildDefaults, childParams, parentWorkflowRunId: workflowRunId, workflowKey: key, ctxCwd: ctx.cwd, workflowCwd, artifactsDir: workflowArtifactsDir, aggregateOutputPath: workflowAggregateOutputPath, configuredOutputBaseDir, discoverAgents: deps.discoverAgents, workflowAgentScope: workflowChildDefaults.agentScope, options: { missionDetached: detachWorkflowChildMissions, runFanoutBudget: workflowFanoutBudget, parentDeadlineAt: workflowDeadlineAt } });
+								}
 								const outputClaims = workflowChildOutputClaims({ ctxCwd: ctx.cwd, workflowCwd, artifactsDir: workflowArtifactsDir, workflowRunId, aggregateOutputPath: workflowAggregateOutputPath, configuredOutputBaseDir, discoverAgents: deps.discoverAgents, workflowAgentScope: workflowChildDefaults.agentScope, claimedOutputPaths, entries: calls });
 								if (outputClaims.error) throw new Error(outputClaims.error);
 								status.runFanoutBudget = claimRunFanoutBatch(workflowFanoutBudget, calls.map(({ key }) => `workflow[${key}]`));
@@ -4295,6 +4310,9 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 						sendWorkflowProgress();
 					},
 					admit: (calls) => {
+						for (const { key, params: childParams } of calls) {
+							preflightWorkflowChildLaunch({ workflowDefaults: workflowChildDefaults, childParams, parentWorkflowRunId: _id, workflowKey: key, ctxCwd: ctx.cwd, workflowCwd, artifactsDir: workflowArtifactsDir, aggregateOutputPath: workflowAggregateOutputPath, configuredOutputBaseDir, discoverAgents: deps.discoverAgents, workflowAgentScope: workflowChildDefaults.agentScope, options: { missionDetached: detachWorkflowChildMissions, suppressRoutineResultIntercom: chatProgress.mode === "live-card", runFanoutBudget: workflowFanoutBudget, parentDeadlineAt: workflowDeadlineAt } });
+						}
 						const outputClaims = workflowChildOutputClaims({ ctxCwd: ctx.cwd, workflowCwd, artifactsDir: workflowArtifactsDir, workflowRunId: _id, aggregateOutputPath: workflowAggregateOutputPath, configuredOutputBaseDir, discoverAgents: deps.discoverAgents, workflowAgentScope: workflowChildDefaults.agentScope, claimedOutputPaths, entries: calls });
 						if (outputClaims.error) throw new Error(outputClaims.error);
 						claimRunFanoutBatch(workflowFanoutBudget, calls.map(({ key }) => `workflow[${key}]`));
@@ -4999,10 +5017,13 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		if (canonicalParams.error) return buildRequestedModeError(effectiveParams, canonicalParams.error);
 		effectiveParams = canonicalParams.params!;
 		const modelScope = discovered.modelScope;
-		effectiveParams = applySingleAgentLaunchDefaults(effectiveParams, discoveredAgents);
+		const singleAgentDefaults = applySingleAgentLaunchDefaults(effectiveParams, discoveredAgents);
+		if (singleAgentDefaults.error) return buildRequestedModeError(effectiveParams, singleAgentDefaults.error);
+		effectiveParams = singleAgentDefaults.params!;
 		const turnBudget = resolveTurnBudgetConfig(effectiveParams.turnBudget ?? deps.config.turnBudget);
 		if (turnBudget.error) return buildRequestedModeError(effectiveParams, turnBudget.error);
-		const checkpointPolicy = effectiveParams.checkpointPolicy === undefined ? undefined : validateCheckpointPolicy(effectiveParams.checkpointPolicy);
+		const checkpointPolicyInput = effectiveParams.checkpointPolicy ?? deps.config.checkpointPolicy;
+		const checkpointPolicy = checkpointPolicyInput === undefined ? undefined : validateCheckpointPolicy(checkpointPolicyInput, effectiveParams.checkpointPolicy === undefined ? "config.checkpointPolicy" : "checkpointPolicy");
 		if (checkpointPolicy?.error) return buildRequestedModeError(effectiveParams, checkpointPolicy.error);
 		if (checkpointPolicy?.policy) effectiveParams = { ...effectiveParams, checkpointPolicy: checkpointPolicy.policy };
 		// An agent-level defaultContext is a preference, unlike an explicit request.

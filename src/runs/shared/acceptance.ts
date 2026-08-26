@@ -23,6 +23,7 @@ import type {
 	SubagentRunMode,
 } from "../../shared/types.ts";
 import { isAgentContractV1 } from "./agent-contract.ts";
+import { formatReviewCheckpointFinding } from "./review-checkpoint.ts";
 import { classifyTaskMutationIntent, stripSeverityCompounds, taskMayMutate } from "./task-intent.ts";
 
 const LEVEL_RANK: Record<Exclude<AcceptanceLevel, "auto">, number> = {
@@ -1234,7 +1235,9 @@ export async function evaluateAcceptance(input: {
 	abortMessage?: string;
 	reportOptional?: boolean;
 	/** Runtime-validated checkpoint evidence. It is the only review-findings source when required. */
-	checkpointEvidence?: { reviewFindings: string[]; residualRisks: string[] };
+	checkpointEvidence?: import("../../shared/types.ts").ReviewCheckpointEvidence;
+	/** Child terminal cause supplied by the runner, never inferred from output. */
+	checkpointTerminalCause?: import("../../shared/types.ts").TerminalCause;
 	requireCheckpoint?: boolean;
 	artifactsDir?: string;
 	runId?: string;
@@ -1252,8 +1255,13 @@ export async function evaluateAcceptance(input: {
 		verifyRuns: [],
 	};
 	if (acceptance.level === "none") return ledger;
-	if (input.requireCheckpoint && !input.checkpointEvidence) {
-		ledger.runtimeChecks.push({ id: "review-checkpoint", status: "failed", message: "A validated review checkpoint is required but none was recovered." });
+	if (input.requireCheckpoint && (!input.checkpointEvidence || input.checkpointEvidence.state !== "complete" || input.checkpointTerminalCause !== "completed")) {
+		const message = !input.checkpointEvidence
+			? "A validated final complete review checkpoint is required but none was recovered."
+			: input.checkpointEvidence.state !== "complete"
+				? `Review checkpoint evidence is ${input.checkpointEvidence.state}, not final complete.`
+				: `Review checkpoint came from terminal cause '${input.checkpointTerminalCause ?? "unknown"}', not normal completion.`;
+		ledger.runtimeChecks.push({ id: "review-checkpoint", status: "failed", message });
 		ledger.status = "rejected";
 		ledger.evidenceStatus = "rejected";
 		return ledger;
@@ -1270,8 +1278,7 @@ export async function evaluateAcceptance(input: {
 	const needsReport = acceptanceRequiresChildReport(acceptance);
 	if (parsed.report) {
 		if (input.requireCheckpoint && input.checkpointEvidence) {
-			parsed.report.reviewFindings = [...input.checkpointEvidence.reviewFindings];
-			parsed.report.residualRisks = [...input.checkpointEvidence.residualRisks];
+			parsed.report.reviewFindings = input.checkpointEvidence.findings.map(formatReviewCheckpointFinding);
 		}
 		ledger.childReport = parsed.report;
 		ledger.status = "attested";

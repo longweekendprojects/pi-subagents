@@ -99,7 +99,7 @@ import { acceptanceFailureMessage, buildSkippedAcceptanceLedger, evaluateAccepta
 import { PROMPT_REDACTED } from "../../shared/utils.ts";
 import { attachContractProjections, isAgentContractV1 } from "../shared/agent-contract.ts";
 import { appendTurnBudgetSystemPrompt, formatTurnBudgetOutput, initialTurnBudgetState, turnBudgetDecision, turnBudgetDeferredNote, turnBudgetDeferredState, turnBudgetExceededMessage, turnBudgetSoftNote, turnBudgetState } from "../shared/turn-budget.ts";
-import { checkpointStorePath, projectCheckpointEvidence, salvageReviewCheckpoints } from "../shared/review-checkpoint.ts";
+import { checkpointMachineArtifactPath, checkpointStorePath, projectCheckpointEvidence, salvageReviewCheckpoints, validateCheckpointPolicy, writeReviewCheckpointMachineArtifact } from "../shared/review-checkpoint.ts";
 import { initialToolBudgetState, toolBudgetState } from "../shared/tool-budget.ts";
 import { resolveWatchdogConfig } from "../../watchdog/settings.ts";
 import { agentDefinitionDigest, launchBindingDigest } from "../../shared/launch-contract.ts";
@@ -159,7 +159,9 @@ function persistSingleResultMetadata(input: {
 		terminalCause: target.terminalCause,
 		checkpointPolicy: target.checkpointPolicy,
 		reviewCheckpoints: target.reviewCheckpoints,
+		reviewCheckpointState: target.reviewCheckpointState,
 		reviewFindings: target.reviewFindings,
+		reviewCheckpointArtifactPath: target.reviewCheckpointArtifactPath,
 		residualRisks: target.residualRisks,
 		usage: target.usage,
 		model: target.model,
@@ -316,6 +318,9 @@ async function runSingleAttempt(
 		orcaProgressTab?: OrcaProgressTab;
 	},
 ): Promise<SingleResult> {
+	const checkpointPolicy = options.checkpointPolicy === undefined
+		? undefined
+		: validateCheckpointPolicy(options.checkpointPolicy).policy;
 	const effectiveThinking = options.thinkingOverride ?? agent.thinking;
 	const modelArg = applyThinkingSuffix(model, effectiveThinking, options.thinkingOverride !== undefined);
 	const resolvedThinking = resolveEffectiveThinking(modelArg, effectiveThinking);
@@ -367,8 +372,11 @@ async function runSingleAttempt(
 		steerCapabilityPath: options.steerCapabilityPath,
 		steerAckDir: options.steerAckDir,
 		structuredOutput: options.structuredOutput,
-		checkpointPolicy: options.checkpointPolicy,
+		checkpointPolicy,
 		reviewCheckpointStorePath: options.reviewCheckpointStorePath,
+		checkpointFinalizeAt: checkpointPolicy && options.timeoutMs !== undefined
+			? (options.deadlineAt ?? Date.now() + options.timeoutMs) - checkpointPolicy.finalizeReserveMs
+			: undefined,
 		toolBudget: options.toolBudget,
 		allowZeroToolBudget: options.allowZeroToolBudget,
 		permissionRules,
@@ -387,7 +395,7 @@ async function runSingleAttempt(
 		cwd: options.cwd ?? runtimeCwd,
 		requireReadTool: Boolean(shared.resolvedSkillNames?.length),
 		structuredOutput: Boolean(options.structuredOutput),
-		checkpointPolicy: options.checkpointPolicy,
+		checkpointPolicy,
 		capabilityCeiling: options.capabilityCeiling,
 		inheritedCapabilityCeiling: decodeSubagentCapabilityCeiling(process.env[SUBAGENT_CAPABILITY_CEILING_ENV]),
 		agentName: agent.name,
@@ -409,7 +417,7 @@ async function runSingleAttempt(
 		mcpDirectTools: toolPlan.effectiveMcpTools,
 		...(options.outputPath ? { outputPath: options.outputPath } : {}),
 		outputMode: options.outputMode ?? "inline",
-		...(options.checkpointPolicy ? { checkpointPolicy: options.checkpointPolicy } : {}),
+		...(checkpointPolicy ? { checkpointPolicy } : {}),
 		...(options.structuredOutput ? { structuredOutputSchema: options.structuredOutput.schema } : {}),
 	});
 	const result: SingleResult = withRunContext({
@@ -430,7 +438,7 @@ async function runSingleAttempt(
 		skills: shared.resolvedSkillNames,
 		skillsWarning: shared.skillsWarning,
 		...(options.turnBudget ? { turnBudget: initialTurnBudgetState(options.turnBudget) } : {}),
-		...(options.checkpointPolicy ? { checkpointPolicy: options.checkpointPolicy } : {}),
+		...(checkpointPolicy ? { checkpointPolicy } : {}),
 		...(options.toolBudget ? { toolBudget: initialToolBudgetState(options.toolBudget) } : {}),
 		...(options.capabilityCeiling ? { capabilityCeiling: options.capabilityCeiling } : {}),
 		...(capabilityAudit ? { capabilityAudit } : {}),
@@ -1575,8 +1583,22 @@ async function runSyncCompletionInner(
 	task: string,
 	options: RunSyncOptions,
 ): Promise<SingleResult> {
+	const checkpointValidation = options.checkpointPolicy === undefined ? undefined : validateCheckpointPolicy(options.checkpointPolicy);
+	if (checkpointValidation?.error) {
+		return redactResultPrompt(withRunContext({
+			index: options.index ?? 0,
+			agent: agentName,
+			task,
+			exitCode: 1,
+			messages: [],
+			usage: emptyUsage(),
+			error: checkpointValidation.error,
+		}, options.context));
+	}
+	const checkpointPolicy = checkpointValidation?.policy;
 	options = {
 		...options,
+		...(checkpointPolicy ? { checkpointPolicy } : {}),
 		capabilityCeiling: intersectSubagentCapabilityCeilings(options.capabilityCeiling ?? resolveCurrentSubagentCapabilityCeiling(options.parentSessionId), decodeSubagentCapabilityCeiling(process.env[SUBAGENT_CAPABILITY_CEILING_ENV])),
 	};
 	const agent = agents.find((a) => a.name === agentName);
@@ -1664,7 +1686,7 @@ async function runSyncCompletionInner(
 	const acceptancePrompt = formatAcceptancePrompt(effectiveAcceptance, { reportOptional: isAgentContractV1(options.agentContract) });
 	const taskWithAcceptance = acceptancePrompt ? `${task}\n${acceptancePrompt}` : task;
 	options.onEffectivePrompt?.(taskWithAcceptance);
-	const reviewCheckpointStorePath = options.checkpointPolicy
+	const reviewCheckpointStorePath = checkpointPolicy
 		? options.reviewCheckpointStorePath ?? checkpointStorePath(
 			options.artifactsDir ?? path.join(TEMP_ROOT_DIR, "foreground"),
 			options.runId,
@@ -1926,17 +1948,27 @@ async function runSyncCompletionInner(
 	};
 	if (transcriptWriter) result.transcriptPath = artifactPathsResult?.transcriptPath;
 	if (transcriptWriter?.getError()) result.transcriptError = transcriptWriter.getError();
-	if (options.checkpointPolicy) {
+	if (checkpointPolicy) {
 		const checkpoints = salvageReviewCheckpoints({
 			storePath: reviewCheckpointStorePath,
 			transcriptPath: result.transcriptPath,
 			identity: { runId: options.runId, childIndex: options.index ?? 0, agent: agentName },
 		});
+		const evidence = projectCheckpointEvidence(checkpoints);
+		result.reviewCheckpointState = evidence.state;
 		if (checkpoints.length > 0) {
 			result.reviewCheckpoints = checkpoints;
-			const evidence = projectCheckpointEvidence(checkpoints)!;
-			result.reviewFindings = evidence.reviewFindings;
-			result.residualRisks = evidence.residualRisks;
+			result.reviewFindings = evidence.findings;
+		}
+		const terminalCause = result.terminalCause ?? (result.exitCode === 0 && !result.error ? "completed" : "process-failure");
+		const machineArtifactPath = artifactPathsResult?.reviewCheckpointPath
+			?? checkpointMachineArtifactPath(options.artifactsDir ?? path.join(TEMP_ROOT_DIR, "foreground"), options.runId, options.index ?? 0);
+		try {
+			writeReviewCheckpointMachineArtifact({ artifactPath: machineArtifactPath, records: checkpoints, terminalCause });
+			result.reviewCheckpointArtifactPath = machineArtifactPath;
+		} catch (error) {
+			const message = `Review checkpoint artifact finalization failed: ${error instanceof Error ? error.message : String(error)}`;
+			result.metadataSaveError = result.metadataSaveError ? `${result.metadataSaveError}\n${message}` : message;
 		}
 	}
 
@@ -1997,8 +2029,9 @@ async function runSyncCompletionInner(
 					: undefined,
 				cwd: options.cwd ?? runtimeCwd,
 				reportOptional: isAgentContractV1(options.agentContract),
-				...(options.checkpointPolicy && result.reviewCheckpoints?.length ? { checkpointEvidence: projectCheckpointEvidence(result.reviewCheckpoints)! } : {}),
-				requireCheckpoint: Boolean(options.checkpointPolicy),
+				...(checkpointPolicy && result.reviewCheckpoints?.length ? { checkpointEvidence: projectCheckpointEvidence(result.reviewCheckpoints) } : {}),
+				...(checkpointPolicy ? { checkpointTerminalCause: result.terminalCause ?? (result.exitCode === 0 && !result.error ? "completed" : "process-failure") } : {}),
+				requireCheckpoint: Boolean(checkpointPolicy),
 				artifactsDir: options.artifactsDir,
 				runId: options.runId,
 			});

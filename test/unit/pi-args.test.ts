@@ -888,7 +888,7 @@ describe("buildPiArgs system prompt mode wiring", () => {
 		});
 		assert.equal(args[args.indexOf("--tools") + 1], "read,review_checkpoint");
 		assert.deepEqual(JSON.parse(env[REQUIRED_CHILD_TOOLS_ENV] ?? "[]"), ["read", "review_checkpoint"]);
-		assert.equal(env[REVIEW_CHECKPOINT_POLICY_ENV], JSON.stringify({ version: 1 }));
+		assert.equal(env[REVIEW_CHECKPOINT_POLICY_ENV], JSON.stringify({ version: 1, requiredByTurn: 3, reserveTurns: 1, finalizeReserveMs: 120000, collectionReserveMs: 60000 }));
 		assert.equal(env[REVIEW_CHECKPOINT_STORE_ENV], "/tmp/review-checkpoint.json");
 	});
 

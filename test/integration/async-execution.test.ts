@@ -26,7 +26,7 @@ import { resolveSubagentLaunchContract } from "../../src/api/preflight.ts";
 import { discoverAgents } from "../../src/agents/agents.ts";
 import { runSync } from "../../src/runs/foreground/execution.ts";
 import { ACTIVE_ASYNC_CAPACITY_DIR, acquireActiveAsyncCapacity, activeAsyncCapacitySessionKey } from "../../src/runs/background/active-async-capacity.ts";
-import { persistReviewCheckpoint } from "../../src/runs/shared/review-checkpoint.ts";
+import { REVIEW_CHECKPOINT_BUDGET_TRUNCATED_MARKER, persistReviewCheckpoint } from "../../src/runs/shared/review-checkpoint.ts";
 
 interface LaunchResolvedExtensions {
 	version?: number;
@@ -630,7 +630,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			storePath: foregroundStore,
 			identity: { runId: "contract-foreground", agent: agentName, childIndex: 0 },
 			assistantTurn: 1,
-			submission: { reviewFindings: [], residualRisks: [] },
+			submission: { kind: "final", status: "complete" },
 		});
 		mockPi.onCall({ output: "foreground contract comparison" });
 		const foreground = await runSync(tempDir, [discovered], agentName, task, { runId: "contract-foreground", acceptance: false, turnBudget, checkpointPolicy, reviewCheckpointStorePath: foregroundStore });
@@ -644,7 +644,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			storePath: path.join(ASYNC_DIR, asyncId, "review-checkpoints", `${asyncId}-0.json`),
 			identity: { runId: asyncId, agent: agentName, childIndex: 0 },
 			assistantTurn: 1,
-			submission: { reviewFindings: [], residualRisks: [] },
+			submission: { kind: "final", status: "complete" },
 		});
 		const launch = executeAsyncSingle(asyncId, {
 			agent: agentName,
@@ -1766,6 +1766,59 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(status.stopped, true);
 		assert.equal(status.turnBudgetExceeded, undefined);
 		assert.equal(status.steps?.[0]?.status, "stopped");
+	});
+
+	it("writes atomic async checkpoint artifacts for explicit stop, deadline, and no-checkpoint termination", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		for (const testCase of [
+			{ name: "explicit stop", cause: "explicit-stop", stop: true, checkpoint: true },
+			{ name: "deadline", cause: "workflow-deadline", stop: false, checkpoint: true },
+			{ name: "no checkpoint", cause: "explicit-stop", stop: true, checkpoint: false },
+		] as const) {
+			const callIndex = mockPi.callCount();
+			mockPi.onCall({ delay: 10_000 });
+			const id = `async-checkpoint-${testCase.name.replace(/\s+/g, "-")}-${Date.now().toString(36)}`;
+			const artifactsDir = path.join(tempDir, id, "artifacts");
+			executeAsyncSingle(id, {
+				agent: "slow",
+				task: "Wait for terminal checkpoint collection.",
+				agentConfig: makeAgent("slow"),
+				ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+				artifactsDir,
+				artifactConfig: { enabled: true, includeInput: false, includeOutput: true, includeJsonl: false, includeMetadata: true, cleanupDays: 7 },
+				shareEnabled: false,
+				maxSubagentDepth: 2,
+				acceptance: false,
+				checkpointPolicy: { version: 1 },
+				...(testCase.stop ? {} : { timeoutMs: 500 }),
+			});
+			await waitForMockPiCall(mockPi, callIndex);
+			if (testCase.checkpoint) {
+				persistReviewCheckpoint({
+					storePath: path.join(ASYNC_DIR, id, "review-checkpoints", `${id}-0.json`),
+					identity: { runId: id, agent: "slow", childIndex: 0 },
+					assistantTurn: 1,
+					submission: {
+						kind: "finding",
+						finding: { severity: "blocker", path: "src/async-checkpoint.ts", line: 7, claim: "Acknowledged finding survives async terminal collection.", evidence: "The receipt precedes the runner stop signal." },
+					},
+				});
+			}
+			if (testCase.stop) deliverStopRequest({ asyncDir: path.join(ASYNC_DIR, id), source: "test" });
+			const payload = await readAsyncPayload(id);
+			const artifactPath = (payload.results[0] as { reviewCheckpointArtifactPath?: string; artifactPaths?: { reviewCheckpointPath?: string } } | undefined)?.reviewCheckpointArtifactPath
+				?? (payload.results[0] as { artifactPaths?: { reviewCheckpointPath?: string } } | undefined)?.artifactPaths?.reviewCheckpointPath;
+			assert.ok(artifactPath, testCase.name);
+			const text = fs.readFileSync(artifactPath, "utf-8");
+			const artifact = JSON.parse(text) as { status?: string; cause?: string; checkpointState?: string; findings?: Array<{ path?: string }> };
+			assert.equal(artifact.status, "truncated", testCase.name);
+			assert.equal(artifact.cause, testCase.cause, testCase.name);
+			assert.equal(text.split(REVIEW_CHECKPOINT_BUDGET_TRUNCATED_MARKER).length - 1, 1, testCase.name);
+			if (testCase.checkpoint) assert.equal(artifact.findings?.[0]?.path, "src/async-checkpoint.ts", testCase.name);
+			else {
+				assert.equal(artifact.checkpointState, "no-checkpoint");
+				assert.equal((payload.results[0] as { reviewFindings?: unknown[] } | undefined)?.reviewFindings, undefined, "no checkpoint must not look like a clean review");
+			}
+		}
 	});
 
 	it("async launch messages tell the parent not to sleep-poll", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {

@@ -100,12 +100,45 @@ export interface TurnBudgetConfig {
 	graceTurns?: number;
 }
 
-/** Opt-in durable review checkpoint protocol. Its turn gate and reserve are fixed by version 1. */
-export interface ReviewCheckpointPolicy {
+/** Accepted checkpoint-policy input. Omitted v1 fields normalize to their documented fixed values. */
+export interface ReviewCheckpointPolicyInput {
 	version: 1;
+	requiredByTurn?: 3;
+	reserveTurns?: 1;
+	finalizeReserveMs?: 120000;
+	collectionReserveMs?: 60000;
 }
 
-/** A validated, persist-before-acknowledgement review checkpoint from one child runtime. */
+/** Normalized durable review-checkpoint policy for protocol version 1. */
+export interface ReviewCheckpointPolicy {
+	version: 1;
+	requiredByTurn: 3;
+	reserveTurns: 1;
+	finalizeReserveMs: 120000;
+	collectionReserveMs: 60000;
+}
+
+export type ReviewCheckpointFindingSeverity = "blocker" | "major" | "minor" | "non-blocking";
+
+/** One complete, durable review finding. `line` is either one line or a bounded inclusive range. */
+export interface ReviewCheckpointFinding {
+	severity: ReviewCheckpointFindingSeverity;
+	path: string;
+	line: number | { start: number; end: number };
+	claim: string;
+	evidence: string;
+}
+
+export type ReviewCheckpointTruncationCause = Exclude<TerminalCause, "completed"> | "no-checkpoint";
+
+/** The only permitted persisted checkpoint submissions. */
+export type ReviewCheckpointSubmission =
+	| { kind: "finding"; finding: ReviewCheckpointFinding }
+	| { kind: "progress"; status: "no-confirmed-finding-yet" }
+	| { kind: "final"; status: "complete" }
+	| { kind: "final"; status: "truncated"; cause: ReviewCheckpointTruncationCause };
+
+/** A validated, persist-before-acknowledgement checkpoint submission from one child runtime. */
 export interface ReviewCheckpointRecord {
 	version: 1;
 	runId: string;
@@ -114,8 +147,17 @@ export interface ReviewCheckpointRecord {
 	sequence: number;
 	timestamp: string;
 	assistantTurn: number;
-	reviewFindings: string[];
-	residualRisks: string[];
+	submission: ReviewCheckpointSubmission;
+}
+
+export type ReviewCheckpointEvidenceState = "missing" | "incomplete" | "complete" | "truncated";
+
+/** Recovery projection produced only from validated durable receipts. */
+export interface ReviewCheckpointEvidence {
+	state: ReviewCheckpointEvidenceState;
+	findings: ReviewCheckpointFinding[];
+	records: ReviewCheckpointRecord[];
+	finalCause?: ReviewCheckpointTruncationCause;
 }
 
 export interface ResolvedTurnBudget {
@@ -578,7 +620,7 @@ export interface SteeringRecoveryDescriptor {
 
 export type PublicNestedStepSummary = Pick<
 	NestedStepSummary,
-	"agent" | "status" | "model" | "thinking" | "sessionFile" | "transcriptPath" | "transcriptError" | "activityState" | "lastActivityAt" | "currentTool" | "currentToolStartedAt" | "currentPath" | "turnCount" | "toolCount" | "toolBudget" | "toolBudgetBlocked" | "startedAt" | "endedAt" | "error" | "timedOut" | "stopped" | "terminalCause" | "checkpointPolicy" | "reviewCheckpoints" | "reviewFindings" | "residualRisks"
+	"agent" | "status" | "model" | "thinking" | "sessionFile" | "transcriptPath" | "transcriptError" | "activityState" | "lastActivityAt" | "currentTool" | "currentToolStartedAt" | "currentPath" | "turnCount" | "toolCount" | "toolBudget" | "toolBudgetBlocked" | "startedAt" | "endedAt" | "error" | "timedOut" | "stopped" | "terminalCause" | "checkpointPolicy" | "reviewCheckpoints" | "reviewCheckpointState" | "reviewFindings" | "reviewCheckpointArtifactPath" | "residualRisks"
 > & {
 	children?: PublicNestedRunSummary[];
 };
@@ -591,7 +633,7 @@ export type CostSummary = {
 
 export type PublicNestedRunSummary = Pick<
 	NestedRunSummary,
-	"id" | "parentRunId" | "parentStepIndex" | "parentAgent" | "depth" | "path" | "asyncDir" | "sessionId" | "sessionFile" | "intercomTarget" | "ownerIntercomTarget" | "leafIntercomTarget" | "ownerState" | "mode" | "state" | "agent" | "agents" | "model" | "thinking" | "currentStep" | "chainStepCount" | "parallelGroups" | "activityState" | "lastActivityAt" | "currentTool" | "currentToolStartedAt" | "currentPath" | "turnCount" | "toolCount" | "toolBudget" | "toolBudgetBlocked" | "totalTokens" | "totalCost" | "startedAt" | "endedAt" | "lastUpdate" | "error" | "timeoutMs" | "deadlineAt" | "timedOut" | "stopped" | "terminalCause" | "checkpointPolicy" | "reviewCheckpoints" | "reviewFindings" | "residualRisks" | "turnBudget" | "turnBudgetExceeded" | "wrapUpRequested"
+	"id" | "parentRunId" | "parentStepIndex" | "parentAgent" | "depth" | "path" | "asyncDir" | "sessionId" | "sessionFile" | "intercomTarget" | "ownerIntercomTarget" | "leafIntercomTarget" | "ownerState" | "mode" | "state" | "agent" | "agents" | "model" | "thinking" | "currentStep" | "chainStepCount" | "parallelGroups" | "activityState" | "lastActivityAt" | "currentTool" | "currentToolStartedAt" | "currentPath" | "turnCount" | "toolCount" | "toolBudget" | "toolBudgetBlocked" | "totalTokens" | "totalCost" | "startedAt" | "endedAt" | "lastUpdate" | "error" | "timeoutMs" | "deadlineAt" | "timedOut" | "stopped" | "terminalCause" | "checkpointPolicy" | "reviewCheckpoints" | "reviewCheckpointState" | "reviewFindings" | "reviewCheckpointArtifactPath" | "residualRisks" | "turnBudget" | "turnBudgetExceeded" | "wrapUpRequested"
 > & {
 	steps?: PublicNestedStepSummary[];
 	children?: PublicNestedRunSummary[];
@@ -952,8 +994,12 @@ export interface SingleResult {
 	terminalCause?: TerminalCause;
 	checkpointPolicy?: ReviewCheckpointPolicy;
 	reviewCheckpoints?: ReviewCheckpointRecord[];
-	/** Present only when a validated checkpoint explicitly supplied findings, including []. */
-	reviewFindings?: string[];
+	/** Recovery state derived only from validated durable receipts. */
+	reviewCheckpointState?: ReviewCheckpointEvidenceState;
+	/** Complete structured findings recovered from durable checkpoint receipts. */
+	reviewFindings?: ReviewCheckpointFinding[];
+	/** Machine-owned terminal checkpoint artifact, including truncated/no-checkpoint state when applicable. */
+	reviewCheckpointArtifactPath?: string;
 	residualRisks?: string[];
 	turnBudget?: TurnBudgetState;
 	turnBudgetExceeded?: boolean;
@@ -1167,6 +1213,8 @@ export interface ArtifactPaths {
 	jsonlPath: string;
 	transcriptPath: string;
 	metadataPath: string;
+	/** Machine-owned terminal review-checkpoint artifact when checkpointPolicy is enabled. */
+	reviewCheckpointPath: string;
 }
 
 export type ArtifactDirPreference = "project" | "session" | "temp";
@@ -1228,7 +1276,10 @@ export interface NestedStepSummary {
 	terminalCause?: TerminalCause;
 	checkpointPolicy?: ReviewCheckpointPolicy;
 	reviewCheckpoints?: ReviewCheckpointRecord[];
-	reviewFindings?: string[];
+	/** Recovery state derived only from validated durable receipts. */
+	reviewCheckpointState?: ReviewCheckpointEvidenceState;
+	reviewFindings?: ReviewCheckpointFinding[];
+	reviewCheckpointArtifactPath?: string;
 	residualRisks?: string[];
 	turnBudget?: TurnBudgetState;
 	turnBudgetExceeded?: boolean;
@@ -1289,7 +1340,10 @@ export interface NestedRunSummary extends NestedRunAddress {
 	terminalCause?: TerminalCause;
 	checkpointPolicy?: ReviewCheckpointPolicy;
 	reviewCheckpoints?: ReviewCheckpointRecord[];
-	reviewFindings?: string[];
+	/** Recovery state derived only from validated durable receipts. */
+	reviewCheckpointState?: ReviewCheckpointEvidenceState;
+	reviewFindings?: ReviewCheckpointFinding[];
+	reviewCheckpointArtifactPath?: string;
 	residualRisks?: string[];
 	turnBudget?: TurnBudgetState;
 	turnBudgetExceeded?: boolean;
@@ -1444,7 +1498,10 @@ export interface AsyncStatus {
 	terminalCause?: TerminalCause;
 	checkpointPolicy?: ReviewCheckpointPolicy;
 	reviewCheckpoints?: ReviewCheckpointRecord[];
-	reviewFindings?: string[];
+	/** Recovery state derived only from validated durable receipts. */
+	reviewCheckpointState?: ReviewCheckpointEvidenceState;
+	reviewFindings?: ReviewCheckpointFinding[];
+	reviewCheckpointArtifactPath?: string;
 	residualRisks?: string[];
 	turnBudget?: TurnBudgetState;
 	turnBudgetExceeded?: boolean;
@@ -1517,7 +1574,10 @@ export interface AsyncStatus {
 		terminalCause?: TerminalCause;
 		checkpointPolicy?: ReviewCheckpointPolicy;
 		reviewCheckpoints?: ReviewCheckpointRecord[];
-		reviewFindings?: string[];
+		/** Recovery state derived only from validated durable receipts. */
+		reviewCheckpointState?: ReviewCheckpointEvidenceState;
+		reviewFindings?: ReviewCheckpointFinding[];
+		reviewCheckpointArtifactPath?: string;
 		residualRisks?: string[];
 		turnBudget?: TurnBudgetState;
 		turnBudgetExceeded?: boolean;
@@ -1879,7 +1939,7 @@ export interface RunSyncOptions {
 	/** Raw global config.toolTimeoutMs, used by the per-child resolver. */
 	configToolTimeoutMs?: number;
 	turnBudget?: ResolvedTurnBudget;
-	checkpointPolicy?: ReviewCheckpointPolicy;
+	checkpointPolicy?: ReviewCheckpointPolicyInput;
 	/** Durable private checkpoint store supplied by the parent runner. */
 	reviewCheckpointStorePath?: string;
 	usageBudget?: UsageBudgetConfig;
@@ -2077,7 +2137,7 @@ export interface ExtensionConfig {
 	control?: ControlConfig;
 	completionBatch?: CompletionBatchConfig;
 	turnBudget?: TurnBudgetConfig;
-	checkpointPolicy?: ReviewCheckpointPolicy;
+	checkpointPolicy?: ReviewCheckpointPolicyInput;
 	toolBudget?: ToolBudgetConfig;
 	/** Opt-in native tool permissions. Bash remains outside this policy. */
 	permissions?: import("../runs/shared/permissions.ts").PermissionConfig;

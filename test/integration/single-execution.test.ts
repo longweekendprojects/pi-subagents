@@ -61,6 +61,7 @@ import { resolveMissionStoreLocation } from "../../src/missions/store.ts";
 import { missionStatePath } from "../../src/missions/workflow-state.ts";
 import { discardPreservedWorktrees } from "../../src/runs/shared/parallel-handoff.ts";
 import { resolveAsyncResumeTarget } from "../../src/runs/background/async-resume.ts";
+import { REVIEW_CHECKPOINT_BUDGET_TRUNCATED_MARKER, persistReviewCheckpoint } from "../../src/runs/shared/review-checkpoint.ts";
 
 interface ModelAttempt {
 	success?: boolean;
@@ -90,6 +91,7 @@ interface ArtifactPaths {
 	outputPath: string;
 	transcriptPath?: string;
 	metadataPath?: string;
+	reviewCheckpointPath?: string;
 }
 
 interface LaunchResolvedExtensions {
@@ -144,6 +146,8 @@ interface RunSyncResult {
 	agentContract?: { version: 1 };
 	execution?: { status?: string; success?: boolean; exitCode?: number; error?: string };
 	review?: { status?: string };
+	reviewFindings?: unknown[];
+	reviewCheckpointArtifactPath?: string;
 	effects?: { fileMutation?: { status?: string; expected?: boolean; attempted?: boolean; message?: string } };
 	acceptance?: {
 		status?: string;
@@ -4817,9 +4821,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(invalidResult.details?.timeoutMs, executorMod?.DEFAULT_FOREGROUND_TIMEOUT_MS);
 	});
 
-	it("applies the global config timeout default to foreground workflow scripts", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
-		mockPi.onCall({ delay: 5_000, output: "too late" });
-		mockPi.onCall({ delay: 5_000, output: "too late" });
+	it("rejects short foreground workflow deadlines before a child can consume the collection reserve", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
 		const executor = makeExecutor([makeAgent("echo")], { timeoutMs: 250 });
 
 		const configResult = await executor.execute(
@@ -4830,7 +4832,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 			makeMinimalCtx(tempDir),
 		);
 		assert.equal(configResult.isError, true);
-		assert.match(configResult.content[0]?.text ?? "", /Workflow script timed out after 250ms/);
+		assert.match(configResult.content[0]?.text ?? "", /no positive child interval after the 60000ms collection reserve/);
 
 		const explicitResult = await executor.execute(
 			"workflow-config-timeout-explicit",
@@ -4840,7 +4842,8 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 			makeMinimalCtx(tempDir),
 		);
 		assert.equal(explicitResult.isError, true);
-		assert.match(explicitResult.content[0]?.text ?? "", /Workflow script timed out after 150ms/);
+		assert.match(explicitResult.content[0]?.text ?? "", /no positive child interval after the 60000ms collection reserve/);
+		assert.equal(mockPi.callCount(), 0);
 	});
 
 	it("runs omitted async launches in the background when the global default is enabled", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
@@ -5385,6 +5388,52 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(result.error, "Subagent timed out after 150ms.");
 		assert.match(result.finalOutput ?? "", /Subagent timed out after 150ms\./);
 		assert.equal(result.progress.status, "failed");
+	});
+
+	it("writes atomic foreground checkpoint artifacts for explicit stop, deadline, and no-checkpoint termination", async () => {
+		const agents = makeAgentConfigs(["slow"]);
+		for (const testCase of [
+			{ name: "explicit stop", cause: "explicit-stop", stop: true, checkpoint: true },
+			{ name: "deadline", cause: "workflow-deadline", stop: false, checkpoint: true },
+			{ name: "no checkpoint", cause: "explicit-stop", stop: true, checkpoint: false },
+		] as const) {
+			mockPi.onCall({ delay: 10_000 });
+			const runId = `foreground-checkpoint-${testCase.name.replace(/\s+/g, "-")}-${Date.now()}`;
+			const artifactsDir = path.join(tempDir, runId, "artifacts");
+			const storePath = path.join(tempDir, runId, "checkpoint.json");
+			if (testCase.checkpoint) {
+				persistReviewCheckpoint({
+					storePath,
+					identity: { runId, agent: "slow", childIndex: 0 },
+					assistantTurn: 1,
+					submission: {
+						kind: "finding",
+						finding: { severity: "blocker", path: "src/checkpoint.ts", line: 9, claim: "Acknowledged finding survives termination.", evidence: "The durable receipt precedes parent finalization." },
+					},
+				});
+			}
+			const controller = new AbortController();
+			if (testCase.stop) setTimeout(() => controller.abort(), 80);
+			const result = await runSync(tempDir, agents, "slow", "Wait for termination", {
+				runId,
+				checkpointPolicy: { version: 1 },
+				reviewCheckpointStorePath: storePath,
+				artifactsDir,
+				...(testCase.stop ? { signal: controller.signal } : { timeoutMs: 80 }),
+			});
+			const artifactPath = result.reviewCheckpointArtifactPath ?? result.artifactPaths?.reviewCheckpointPath;
+			assert.ok(artifactPath, testCase.name);
+			const text = fs.readFileSync(artifactPath, "utf-8");
+			const artifact = JSON.parse(text) as { status?: string; cause?: string; checkpointState?: string; findings?: Array<{ path?: string }> };
+			assert.equal(artifact.status, "truncated", testCase.name);
+			assert.equal(artifact.cause, testCase.cause, testCase.name);
+			assert.equal(text.split(REVIEW_CHECKPOINT_BUDGET_TRUNCATED_MARKER).length - 1, 1, testCase.name);
+			if (testCase.checkpoint) assert.equal(artifact.findings?.[0]?.path, "src/checkpoint.ts", testCase.name);
+			else {
+				assert.equal(artifact.checkpointState, "no-checkpoint");
+				assert.equal(result.reviewFindings, undefined, "no checkpoint must not look like a clean review");
+			}
+		}
 	});
 
 	it("allows a foreground run to finish on the final turn-budget grace turn", async () => {

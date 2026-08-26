@@ -10,8 +10,7 @@ import { SUBAGENT_CHILD_AGENT_ENV, SUBAGENT_CHILD_INDEX_ENV, SUBAGENT_FANOUT_CHI
 import { RUNTIME_EXTENSION_ACK_EVENT, RUNTIME_EXTENSION_ACK_PATH_ENV, isRuntimeAcknowledgedExtensionId, writeRuntimeAcknowledgedExtensions } from "./runtime-acknowledged-extensions.ts";
 import { createStructuredOutputToolParameters, STRUCTURED_OUTPUT_CAPTURE_ENV, STRUCTURED_OUTPUT_SCHEMA_ENV, validateStructuredOutputValue } from "./structured-output.ts";
 import {
-	REVIEW_CHECKPOINT_FINALIZATION_RESERVE_TURNS,
-	REVIEW_CHECKPOINT_GATE_TURN,
+	REVIEW_CHECKPOINT_FINALIZE_AT_ENV,
 	REVIEW_CHECKPOINT_PARAMETERS_SCHEMA,
 	REVIEW_CHECKPOINT_POLICY_ENV,
 	REVIEW_CHECKPOINT_STORE_ENV,
@@ -52,9 +51,9 @@ const STRUCTURED_OUTPUT_INSTRUCTIONS = [
 ].join("\n");
 
 const REVIEW_CHECKPOINT_INSTRUCTIONS = [
-	"This subagent step requires a durable review checkpoint before its third assistant turn.",
-	"Call `review_checkpoint` with complete reviewFindings and residualRisks arrays. Use [] only when the review is clean or has no residual risks.",
-	"The checkpoint is accepted only after the tool confirms it persisted. Do not rely on prose or a tool start as evidence.",
+	"This subagent step requires durable, incremental review checkpoints before assistant turn 3.",
+	"Call `review_checkpoint` once for each complete structured finding, use progress/no-confirmed-finding-yet only when no finding is confirmed, and finish with final/complete or final/truncated plus its typed cause.",
+	"A finding needs severity, path, one line or a bounded line range, claim, and evidence. A checkpoint is acknowledged only after durable persistence. Do not rely on prose or a tool start as evidence.",
 ].join("\n");
 
 export const CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS = [
@@ -340,33 +339,45 @@ function registerReviewCheckpoint(pi: ExtensionAPI): void {
 	const runId = process.env[SUBAGENT_RUN_ID_ENV]?.trim();
 	const agent = process.env[SUBAGENT_CHILD_AGENT_ENV]?.trim();
 	const childIndex = Number(process.env[SUBAGENT_CHILD_INDEX_ENV]);
+	const rawFinalizeAt = Number(process.env[REVIEW_CHECKPOINT_FINALIZE_AT_ENV]);
+	const finalizeAt = Number.isFinite(rawFinalizeAt) && rawFinalizeAt > 0 ? rawFinalizeAt : undefined;
 	if (!policy || !storePath || !runId || !agent || !Number.isInteger(childIndex) || childIndex < 0) {
 		throw new Error("Invalid review checkpoint runtime configuration.");
 	}
 	let assistantTurn = 0;
 	let checkpointCompleted = false;
-	const onRuntimeEvent = pi.on as unknown as (event: string, handler: (event: { toolName?: unknown; message?: { role?: unknown } }) => unknown) => void;
-	onRuntimeEvent("message_end", (event) => {
-		if (event.message?.role === "assistant") assistantTurn++;
+	let permanentFinalization = false;
+	const structuredOutputActive = Boolean(process.env[STRUCTURED_OUTPUT_CAPTURE_ENV]);
+	const onRuntimeEvent = pi.on as unknown as (event: string, handler: (event: { toolName?: unknown }) => unknown) => void;
+	const beginFinalizationIfDue = (): boolean => {
+		if (permanentFinalization) return true;
+		if (assistantTurn >= policy.requiredByTurn + policy.reserveTurns || (finalizeAt !== undefined && Date.now() >= finalizeAt)) {
+			permanentFinalization = true;
+		}
+		return permanentFinalization;
+	};
+	const allowsFinalizationTool = (toolName: string): boolean => toolName === REVIEW_CHECKPOINT_TOOL_NAME || (toolName === "structured_output" && structuredOutputActive);
+	onRuntimeEvent("turn_start", () => {
+		assistantTurn += 1;
+		beginFinalizationIfDue();
 		return undefined;
 	});
 	onRuntimeEvent("tool_call", (event) => {
-		if (assistantTurn < REVIEW_CHECKPOINT_GATE_TURN || checkpointCompleted) return undefined;
 		const toolName = typeof event.toolName === "string" ? event.toolName : "tool";
-		const finalizationReserveTurn = REVIEW_CHECKPOINT_GATE_TURN + REVIEW_CHECKPOINT_FINALIZATION_RESERVE_TURNS - 1;
-		if (assistantTurn > finalizationReserveTurn) {
-			return {
-				block: true,
-				reason: `Review checkpoint finalization reserve expired after assistant turn ${finalizationReserveTurn}; no tools may run without a persisted checkpoint.`,
-			};
+		if (beginFinalizationIfDue()) {
+			return allowsFinalizationTool(toolName)
+				? undefined
+				: {
+					block: true,
+					reason: `Review checkpoint finalization is permanent at assistant turn ${assistantTurn}. Only '${REVIEW_CHECKPOINT_TOOL_NAME}'${structuredOutputActive ? " and 'structured_output'" : ""} may run.`,
+				};
 		}
-		const allowed = toolName === REVIEW_CHECKPOINT_TOOL_NAME
-			|| (toolName === "structured_output" && Boolean(process.env[STRUCTURED_OUTPUT_CAPTURE_ENV]));
-		return allowed
+		if (assistantTurn < policy.requiredByTurn || checkpointCompleted) return undefined;
+		return allowsFinalizationTool(toolName)
 			? undefined
 			: {
 				block: true,
-				reason: `Review checkpoint finalization reserve is active at assistant turn ${assistantTurn}. Only '${REVIEW_CHECKPOINT_TOOL_NAME}'${process.env[STRUCTURED_OUTPUT_CAPTURE_ENV] ? " and 'structured_output'" : ""} may run until a checkpoint persists.`,
+				reason: `Review checkpoint gate is active at assistant turn ${assistantTurn}. Only '${REVIEW_CHECKPOINT_TOOL_NAME}'${structuredOutputActive ? " and 'structured_output'" : ""} may run until a checkpoint persists.`,
 			};
 	});
 	if (typeof pi.registerTool !== "function") return;
@@ -380,7 +391,7 @@ function registerReviewCheckpoint(pi: ExtensionAPI): void {
 	registerTool({
 		name: REVIEW_CHECKPOINT_TOOL_NAME,
 		label: "Review Checkpoint",
-		description: "Persist complete review findings and residual risks before finalization. This is acknowledged only after durable persistence.",
+		description: "Persist one structured finding, explicit progress, or a final complete/truncated status. This is acknowledged only after durable persistence.",
 		parameters: createStructuredOutputToolParameters(REVIEW_CHECKPOINT_PARAMETERS_SCHEMA) as never,
 		async execute(_id: string, params: { value: unknown }) {
 			const schemaValidation = await validateStructuredOutputValue(REVIEW_CHECKPOINT_PARAMETERS_SCHEMA, params.value);

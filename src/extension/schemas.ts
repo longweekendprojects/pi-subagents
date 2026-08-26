@@ -108,7 +108,11 @@ const TurnBudgetOverride = Type.Object({
 
 const CheckpointPolicyOverride = Type.Object({
 	version: Type.Integer({ minimum: 1, maximum: 1 }),
-}, { additionalProperties: false, description: "Opt in to durable review checkpoints. Version 1 requires a checkpoint before assistant turn 3 and reserves finalization tools until it persists." });
+	requiredByTurn: Type.Optional(Type.Integer({ minimum: 3, maximum: 3 })),
+	reserveTurns: Type.Optional(Type.Integer({ minimum: 1, maximum: 1 })),
+	finalizeReserveMs: Type.Optional(Type.Integer({ minimum: 120000, maximum: 120000 })),
+	collectionReserveMs: Type.Optional(Type.Integer({ minimum: 60000, maximum: 60000 })),
+}, { additionalProperties: false, description: "Opt in to durable review checkpoints. Version 1 normalizes requiredByTurn:3, reserveTurns:1, finalizeReserveMs:120000, and collectionReserveMs:60000; supplied values must match exactly." });
 
 const ToolBudgetBlock = Type.Unsafe({
 	anyOf: [

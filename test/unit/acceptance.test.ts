@@ -635,7 +635,7 @@ describe("acceptance gates", () => {
 		}
 	});
 
-	it("distinguishes a missing checkpoint from an explicitly clean checkpoint", async () => {
+	it("accepts checkpoint-required review evidence only after final complete normal completion", async () => {
 		const cwd = tempRepo();
 		try {
 			const acceptance = resolveEffectiveAcceptance({
@@ -643,24 +643,24 @@ describe("acceptance gates", () => {
 				task: "Review-only. Do not edit.",
 				explicit: { level: "checked", evidence: ["review-findings"] },
 			});
-			const missing = await evaluateAcceptance({
-				acceptance,
-				output: report({ reviewFindings: [] }),
-				cwd,
-				requireCheckpoint: true,
-			});
-			assert.equal(missing.status, "rejected");
-			assert.match(acceptanceFailureMessage(missing) ?? "", /validated review checkpoint is required/);
-
-			const clean = await evaluateAcceptance({
-				acceptance,
-				output: report({ reviewFindings: ["prose must not become evidence"] }),
-				cwd,
-				requireCheckpoint: true,
-				checkpointEvidence: { reviewFindings: [], residualRisks: [] },
-			});
-			assert.equal(clean.status, "checked");
-			assert.deepEqual(clean.childReport?.reviewFindings, []);
+			for (const testCase of [
+				{ name: "missing", evidence: undefined, cause: undefined, status: "rejected" },
+				{ name: "partial", evidence: { state: "incomplete", findings: [], records: [] } as const, cause: "completed" as const, status: "rejected" },
+				{ name: "truncated", evidence: { state: "truncated", findings: [], records: [], finalCause: "workflow-deadline" } as const, cause: "completed" as const, status: "rejected" },
+				{ name: "interrupted", evidence: { state: "complete", findings: [], records: [] } as const, cause: "interrupt" as const, status: "rejected" },
+				{ name: "normal final complete", evidence: { state: "complete", findings: [], records: [] } as const, cause: "completed" as const, status: "checked" },
+			] as const) {
+				const ledger = await evaluateAcceptance({
+					acceptance,
+					output: report({ reviewFindings: ["prose must not become evidence"] }),
+					cwd,
+					requireCheckpoint: true,
+					checkpointEvidence: testCase.evidence,
+					checkpointTerminalCause: testCase.cause,
+				});
+				assert.equal(ledger.status, testCase.status, testCase.name);
+				if (testCase.status === "checked") assert.deepEqual(ledger.childReport?.reviewFindings, []);
+			}
 		} finally {
 			fs.rmSync(cwd, { recursive: true, force: true });
 		}

@@ -134,7 +134,7 @@ import { attachContractProjections, isAgentContractV1 } from "../shared/agent-co
 import { waitForImportedAsyncRoot } from "./chain-root-attachment.ts";
 import { appendRunnerStepsToStatus, consumeChainAppendRequests, countPendingChainAppendRequests, statusStepDescription } from "./chain-append.ts";
 import { appendTurnBudgetSystemPrompt, formatTurnBudgetOutput, initialTurnBudgetState, turnBudgetDecision, turnBudgetDeferredNote, turnBudgetDeferredState, turnBudgetExceededMessage, turnBudgetSoftNote, turnBudgetState } from "../shared/turn-budget.ts";
-import { checkpointStorePath, projectCheckpointEvidence, salvageReviewCheckpoints } from "../shared/review-checkpoint.ts";
+import { checkpointMachineArtifactPath, checkpointStorePath, projectCheckpointEvidence, salvageReviewCheckpoints, writeReviewCheckpointMachineArtifact } from "../shared/review-checkpoint.ts";
 import { initialToolBudgetState, toolBudgetState } from "../shared/tool-budget.ts";
 import { effectiveToolTimeoutMs, formatToolTimeoutMessage, toolTimeoutCallKey } from "../shared/tool-timeout.ts";
 import { usageBudgetExceededMessage, usageBudgetState } from "../shared/usage-budget.ts";
@@ -234,7 +234,9 @@ interface StepResult {
 	processSignal?: string | null;
 	checkpointPolicy?: ReviewCheckpointPolicy;
 	reviewCheckpoints?: ReviewCheckpointRecord[];
-	reviewFindings?: string[];
+	reviewCheckpointState?: import("../../shared/types.ts").ReviewCheckpointEvidenceState;
+	reviewFindings?: import("../../shared/types.ts").ReviewCheckpointFinding[];
+	reviewCheckpointArtifactPath?: string;
 	residualRisks?: string[];
 	turnBudget?: TurnBudgetState;
 	turnBudgetExceeded?: boolean;
@@ -1543,6 +1545,9 @@ async function runSingleStepInner(
 			structuredOutput: effectiveStructuredOutput,
 			checkpointPolicy: step.checkpointPolicy,
 			reviewCheckpointStorePath,
+			checkpointFinalizeAt: step.checkpointPolicy && ctx.deadlineAt !== undefined
+				? ctx.deadlineAt - step.checkpointPolicy.finalizeReserveMs
+				: undefined,
 			toolBudget: step.toolBudget,
 			permissionRules: step.permissionRules,
 			permissionAuditPath: step.permissionRules && ctx.artifactsDir
@@ -1844,6 +1849,13 @@ async function runSingleStepInner(
 		})
 		: [];
 	const checkpointEvidence = projectCheckpointEvidence(checkpoints);
+	const checkpointTerminalCauseBeforeAcceptance: TerminalCause = finalResult?.stopped === true || ctx.stopSignal?.aborted === true
+		? "explicit-stop"
+		: finalResult?.timedOut === true || ctx.timeoutSignal?.aborted === true
+			? "workflow-deadline"
+			: finalResult?.turnBudgetExceeded === true
+				? "turn-budget"
+				: finalResult?.terminalCause ?? ((finalResult?.exitCode ?? 1) === 0 && !finalResult?.error ? "completed" : "process-failure");
 	const finalizedOutput = finalizeSingleOutput(omitUndefinedProperties({
 		fullOutput: outputForSummary,
 		outputPath: step.outputPath,
@@ -1865,7 +1877,7 @@ async function runSingleStepInner(
 			signal: combinedAbortSignal([ctx.timeoutSignal, ctx.stopSignal]),
 			abortMessage: ctx.stopSignal?.aborted ? ctx.stopMessage ?? "Subagent stopped by user." : ctx.timeoutMessage ?? "Subagent timed out.",
 			reportOptional: isAgentContractV1(step.agentContract),
-			...(checkpointEvidence ? { checkpointEvidence } : {}),
+			...(step.checkpointPolicy ? { checkpointEvidence, checkpointTerminalCause: checkpointTerminalCauseBeforeAcceptance } : {}),
 			requireCheckpoint: Boolean(step.checkpointPolicy),
 			artifactsDir: ctx.artifactsDir,
 			runId: ctx.id,
@@ -1874,6 +1886,13 @@ async function runSingleStepInner(
 	const stoppedAfterAcceptance = finalResult?.stopped === true || ctx.stopSignal?.aborted === true;
 	const timedOutAfterAcceptance = !stoppedAfterAcceptance && (finalResult?.timedOut === true || ctx.timeoutSignal?.aborted === true);
 	const turnBudgetExceeded = finalResult?.turnBudgetExceeded === true;
+	const terminalCause: TerminalCause = stoppedAfterAcceptance
+		? "explicit-stop"
+		: timedOutAfterAcceptance
+			? "workflow-deadline"
+			: turnBudgetExceeded
+				? "turn-budget"
+				: finalResult?.terminalCause ?? ((finalResult?.exitCode ?? 1) === 0 && !finalResult?.error ? "completed" : "process-failure");
 	const effectiveAcceptance = step.effectiveAcceptance
 		? stoppedAfterAcceptance
 			? buildSkippedAcceptanceLedger(step.effectiveAcceptance, { id: "stopped", message: "Acceptance was not evaluated because the subagent was stopped." })
@@ -1896,6 +1915,18 @@ async function runSingleStepInner(
 				: acceptanceCanFailRun
 					? (finalResult?.error ? `${finalResult.error}\n${acceptanceFailure}` : acceptanceFailure)
 					: finalResult?.error ?? (intercomDetachReceipt ? INTERCOM_DETACH_RECEIPT : undefined);
+	let reviewCheckpointArtifactPath: string | undefined;
+	let reviewCheckpointArtifactError: string | undefined;
+	if (step.checkpointPolicy) {
+		reviewCheckpointArtifactPath = artifactPaths?.reviewCheckpointPath
+			?? checkpointMachineArtifactPath(path.dirname(ctx.outputFile), ctx.id, ctx.flatIndex);
+		try {
+			writeReviewCheckpointMachineArtifact({ artifactPath: reviewCheckpointArtifactPath, records: checkpoints, terminalCause });
+		} catch (error) {
+			reviewCheckpointArtifactError = `Review checkpoint artifact finalization failed: ${error instanceof Error ? error.message : String(error)}`;
+			reviewCheckpointArtifactPath = undefined;
+		}
+	}
 
 	const artifactErrors = artifactPaths && ctx.artifactConfig?.enabled !== false
 		? persistStepArtifacts({
@@ -1924,7 +1955,9 @@ async function runSingleStepInner(
 				...((finalResult as (RunPiStreamingResult & { runtimeAcknowledgedExtensions?: RuntimeAcknowledgedChildExtensionsV1 }) | undefined)?.runtimeAcknowledgedExtensions ? { runtimeAcknowledgedExtensions: (finalResult as RunPiStreamingResult & { runtimeAcknowledgedExtensions?: RuntimeAcknowledgedChildExtensionsV1 }).runtimeAcknowledgedExtensions } : {}),
 				...(transcriptWriter ? { transcriptPath: artifactPaths.transcriptPath } : {}),
 				transcriptError: transcriptWriter?.getError(),
-				...(checkpoints.length ? { reviewCheckpoints: checkpoints, reviewFindings: checkpointEvidence?.reviewFindings, residualRisks: checkpointEvidence?.residualRisks } : {}),
+				...(step.checkpointPolicy ? { reviewCheckpointState: checkpointEvidence.state } : {}),
+				...(checkpoints.length ? { reviewCheckpoints: checkpoints, reviewFindings: checkpointEvidence.findings } : {}),
+				...(reviewCheckpointArtifactPath ? { reviewCheckpointArtifactPath } : {}),
 				skills: step.skills,
 				timestamp: Date.now(),
 			},
@@ -1949,14 +1982,16 @@ async function runSingleStepInner(
 		totalCost: costSummaryFromAttempts(modelAttempts),
 		artifactPaths,
 		outputSaveError: artifactErrors.outputSaveError,
-		metadataSaveError: artifactErrors.metadataSaveError,
+		metadataSaveError: [artifactErrors.metadataSaveError, reviewCheckpointArtifactError].filter((message): message is string => Boolean(message)).join("\n") || undefined,
 		transcriptPath: transcriptWriter ? artifactPaths?.transcriptPath : undefined,
 		transcriptError: transcriptWriter?.getError(),
 		interrupted: timedOutAfterAcceptance || stoppedAfterAcceptance || turnBudgetExceeded ? false : finalResult?.interrupted,
 		timedOut: timedOutAfterAcceptance ? true : finalResult?.timedOut,
 		stopped: stoppedAfterAcceptance ? true : finalResult?.stopped,
-		terminalCause: stoppedAfterAcceptance ? "explicit-stop" : timedOutAfterAcceptance ? "workflow-deadline" : turnBudgetExceeded ? "turn-budget" : finalResult?.terminalCause,
-		...(checkpoints.length ? { reviewCheckpoints: checkpoints, reviewFindings: checkpointEvidence?.reviewFindings, residualRisks: checkpointEvidence?.residualRisks } : {}),
+		terminalCause,
+		...(step.checkpointPolicy ? { reviewCheckpointState: checkpointEvidence.state } : {}),
+		...(checkpoints.length ? { reviewCheckpoints: checkpoints, reviewFindings: checkpointEvidence.findings } : {}),
+		...(reviewCheckpointArtifactPath ? { reviewCheckpointArtifactPath } : {}),
 		checkpointPolicy: step.checkpointPolicy,
 		processSignal: finalResult?.processSignal,
 		turnBudget,
@@ -3899,7 +3934,9 @@ async function runSubagent(
 				setOptionalProperty(requiredStatusStep(statusPayload, fi), "terminalCause", stopped || childStopped ? "explicit-stop" : timedOut ? "workflow-deadline" : singleResult.terminalCause);
 				setOptionalProperty(requiredStatusStep(statusPayload, fi), "checkpointPolicy", singleResult.checkpointPolicy);
 				setOptionalProperty(requiredStatusStep(statusPayload, fi), "reviewCheckpoints", singleResult.reviewCheckpoints);
+				setOptionalProperty(requiredStatusStep(statusPayload, fi), "reviewCheckpointState", singleResult.reviewCheckpointState);
 				setOptionalProperty(requiredStatusStep(statusPayload, fi), "reviewFindings", singleResult.reviewFindings);
+				setOptionalProperty(requiredStatusStep(statusPayload, fi), "reviewCheckpointArtifactPath", singleResult.reviewCheckpointArtifactPath);
 				setOptionalProperty(requiredStatusStep(statusPayload, fi), "residualRisks", singleResult.residualRisks);
 				setOptionalProperty(requiredStatusStep(statusPayload, fi), "turnBudget", singleResult.turnBudget);
 				setOptionalProperty(requiredStatusStep(statusPayload, fi), "turnBudgetExceeded", singleResult.turnBudgetExceeded);
@@ -3977,7 +4014,9 @@ async function runSubagent(
 					terminalCause: pr.terminalCause,
 					checkpointPolicy: pr.checkpointPolicy,
 					reviewCheckpoints: pr.reviewCheckpoints,
+					reviewCheckpointState: pr.reviewCheckpointState,
 					reviewFindings: pr.reviewFindings,
+					reviewCheckpointArtifactPath: pr.reviewCheckpointArtifactPath,
 					residualRisks: pr.residualRisks,
 					turnBudget: pr.turnBudget,
 					turnBudgetExceeded: pr.turnBudgetExceeded,
@@ -4303,7 +4342,9 @@ async function runSubagent(
 						setOptionalProperty(requiredStatusStep(statusPayload, fi), "terminalCause", stopped || childStopped ? "explicit-stop" : timedOut ? "workflow-deadline" : singleResult.terminalCause);
 						setOptionalProperty(requiredStatusStep(statusPayload, fi), "checkpointPolicy", singleResult.checkpointPolicy);
 						setOptionalProperty(requiredStatusStep(statusPayload, fi), "reviewCheckpoints", singleResult.reviewCheckpoints);
+						setOptionalProperty(requiredStatusStep(statusPayload, fi), "reviewCheckpointState", singleResult.reviewCheckpointState);
 						setOptionalProperty(requiredStatusStep(statusPayload, fi), "reviewFindings", singleResult.reviewFindings);
+						setOptionalProperty(requiredStatusStep(statusPayload, fi), "reviewCheckpointArtifactPath", singleResult.reviewCheckpointArtifactPath);
 						setOptionalProperty(requiredStatusStep(statusPayload, fi), "residualRisks", singleResult.residualRisks);
 						setOptionalProperty(requiredStatusStep(statusPayload, fi), "turnBudget", singleResult.turnBudget);
 						setOptionalProperty(requiredStatusStep(statusPayload, fi), "turnBudgetExceeded", singleResult.turnBudgetExceeded);
@@ -4415,7 +4456,9 @@ async function runSubagent(
 						terminalCause: pr.terminalCause,
 						checkpointPolicy: pr.checkpointPolicy,
 						reviewCheckpoints: pr.reviewCheckpoints,
+						reviewCheckpointState: pr.reviewCheckpointState,
 						reviewFindings: pr.reviewFindings,
+						reviewCheckpointArtifactPath: pr.reviewCheckpointArtifactPath,
 						residualRisks: pr.residualRisks,
 						turnBudget: pr.turnBudget,
 						turnBudgetExceeded: pr.turnBudgetExceeded,
@@ -4664,7 +4707,9 @@ async function runSubagent(
 				terminalCause: stopped || childStopped ? "explicit-stop" : timedOut ? "workflow-deadline" : singleResult.terminalCause,
 				checkpointPolicy: singleResult.checkpointPolicy,
 				reviewCheckpoints: singleResult.reviewCheckpoints,
+				reviewCheckpointState: singleResult.reviewCheckpointState,
 				reviewFindings: singleResult.reviewFindings,
+				reviewCheckpointArtifactPath: singleResult.reviewCheckpointArtifactPath,
 				residualRisks: singleResult.residualRisks,
 				turnBudget: singleResult.turnBudget,
 				turnBudgetExceeded: singleResult.turnBudgetExceeded,
@@ -4716,7 +4761,9 @@ async function runSubagent(
 			setOptionalProperty(requiredStatusStep(statusPayload, flatIndex), "terminalCause", stopped || childStopped ? "explicit-stop" : timedOut ? "workflow-deadline" : singleResult.terminalCause);
 			setOptionalProperty(requiredStatusStep(statusPayload, flatIndex), "checkpointPolicy", singleResult.checkpointPolicy);
 			setOptionalProperty(requiredStatusStep(statusPayload, flatIndex), "reviewCheckpoints", singleResult.reviewCheckpoints);
+			setOptionalProperty(requiredStatusStep(statusPayload, flatIndex), "reviewCheckpointState", singleResult.reviewCheckpointState);
 			setOptionalProperty(requiredStatusStep(statusPayload, flatIndex), "reviewFindings", singleResult.reviewFindings);
+			setOptionalProperty(requiredStatusStep(statusPayload, flatIndex), "reviewCheckpointArtifactPath", singleResult.reviewCheckpointArtifactPath);
 			setOptionalProperty(requiredStatusStep(statusPayload, flatIndex), "residualRisks", singleResult.residualRisks);
 			setOptionalProperty(requiredStatusStep(statusPayload, flatIndex), "turnBudget", singleResult.turnBudget);
 			setOptionalProperty(requiredStatusStep(statusPayload, flatIndex), "turnBudgetExceeded", singleResult.turnBudgetExceeded);
@@ -5001,7 +5048,9 @@ async function runSubagent(
 				terminalCause: r.terminalCause,
 				checkpointPolicy: r.checkpointPolicy,
 				reviewCheckpoints: r.reviewCheckpoints,
+				reviewCheckpointState: r.reviewCheckpointState,
 				reviewFindings: r.reviewFindings,
+				reviewCheckpointArtifactPath: r.reviewCheckpointArtifactPath,
 				residualRisks: r.residualRisks,
 				processSignal: r.processSignal || undefined,
 				turnBudget: r.turnBudget,

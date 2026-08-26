@@ -19,6 +19,7 @@ import {
 	STRUCTURED_OUTPUT_SCHEMA_ENV,
 } from "./structured-output.ts";
 import {
+	REVIEW_CHECKPOINT_FINALIZE_AT_ENV,
 	REVIEW_CHECKPOINT_POLICY_ENV,
 	REVIEW_CHECKPOINT_STORE_ENV,
 	validateCheckpointPolicy,
@@ -181,6 +182,8 @@ export interface BuildPiArgsInput {
 	};
 	checkpointPolicy?: ReviewCheckpointPolicy;
 	reviewCheckpointStorePath?: string;
+	/** Absolute time when the child must remain in permanent checkpoint finalization. */
+	checkpointFinalizeAt?: number;
 	toolBudget?: ResolvedToolBudget;
 	allowZeroToolBudget?: boolean;
 	permissionRules?: PermissionRules;
@@ -829,6 +832,9 @@ export function buildPiArgs(input: BuildPiArgsInput): BuildPiArgsResult {
 		if (!input.reviewCheckpointStorePath?.trim()) throw new Error("checkpointPolicy requires a durable review checkpoint store path.");
 		env[REVIEW_CHECKPOINT_POLICY_ENV] = JSON.stringify(policy.policy);
 		env[REVIEW_CHECKPOINT_STORE_ENV] = input.reviewCheckpointStorePath;
+		if (input.checkpointFinalizeAt !== undefined && Number.isFinite(input.checkpointFinalizeAt)) {
+			env[REVIEW_CHECKPOINT_FINALIZE_AT_ENV] = String(input.checkpointFinalizeAt);
+		}
 	}
 	if (input.steerInboxDir) {
 		env[SUBAGENT_STEER_INBOX_ENV] = input.steerInboxDir;

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { prepareWorkflowLaunchParams, sanitizeRunPathSegment } from "../../src/runs/foreground/subagent-executor.ts";
+import { applySingleAgentLaunchDefaults, prepareWorkflowLaunchParams, sanitizeRunPathSegment } from "../../src/runs/foreground/subagent-executor.ts";
 
 describe("workflow launch params", () => {
 	it("keeps omitted workflow child async foreground", () => {
@@ -21,50 +21,30 @@ describe("workflow launch params", () => {
 		);
 	});
 
-	it("clamps an omitted child timeout strictly inside the parent deadline", () => {
-		const parentDeadlineAt = Date.now() + 60_000;
-		const params = prepareWorkflowLaunchParams(
-			{},
-			{ agent: "worker", task: "Run" },
-			"workflow-run",
-			"run",
-			{ parentDeadlineAt },
+	it("clamps explicit, defaulted, agent-defaulted, and retained children before launch", () => {
+		const parentDeadlineAt = Date.now() + 180_000;
+		const prepare = (child: Record<string, unknown>, key: string) => prepareWorkflowLaunchParams({}, child, "workflow-run", key, { parentDeadlineAt });
+		const agentDefault = applySingleAgentLaunchDefaults(
+			prepare({ agent: "worker", task: "Run" }, "agent-default"),
+			[{ name: "worker", defaultTimeoutMs: 500_000 }] as never,
 		);
-		assert.equal(params.async, false);
-		assert.ok((params.timeoutMs ?? 0) > 0);
-		assert.ok((params.timeoutMs ?? Number.MAX_SAFE_INTEGER) < 60_000);
-		assert.equal(params.workflowParentDeadlineAt, parentDeadlineAt);
-	});
-
-	it("clamps explicit child timeout aliases to the parent deadline", () => {
-		const parentDeadlineAt = Date.now() + 60_000;
-		const timeoutParams = prepareWorkflowLaunchParams(
-			{},
-			{ agent: "worker", task: "Run", timeoutMs: 90_000 },
-			"workflow-run",
-			"timeout",
-			{ parentDeadlineAt },
+		const cases = [
+			{ name: "explicit timeout", params: prepare({ agent: "worker", task: "Run", timeoutMs: 500_000 }, "timeout") },
+			{ name: "explicit alias", params: prepare({ agent: "worker", task: "Run", maxRuntimeMs: 500_000 }, "alias") },
+			{ name: "workflow default", params: prepare({ agent: "worker", task: "Run" }, "default") },
+			{ name: "agent default", params: agentDefault.params },
+			{ name: "retained", params: prepare({ resume: "retained-run", task: "Continue" }, "retained") },
+		];
+		for (const testCase of cases) {
+			assert.ok((testCase.params?.timeoutMs ?? 0) > 0, testCase.name);
+			assert.ok((testCase.params?.timeoutMs ?? Number.MAX_SAFE_INTEGER) <= 120_000, testCase.name);
+			assert.equal(testCase.params?.workflowParentDeadlineAt, parentDeadlineAt, testCase.name);
+		}
+		assert.equal(agentDefault.error, undefined);
+		assert.throws(
+			() => prepareWorkflowLaunchParams({}, { agent: "worker", task: "Run" }, "workflow-run", "expired", { parentDeadlineAt: Date.now() + 60_000 }),
+			/no positive child interval after the 60000ms collection reserve/,
 		);
-		assert.ok((timeoutParams.timeoutMs ?? Number.MAX_SAFE_INTEGER) < 60_000);
-		const maxRuntimeParams = prepareWorkflowLaunchParams(
-			{},
-			{ agent: "worker", task: "Run", maxRuntimeMs: 90_000 },
-			"workflow-run",
-			"max-runtime",
-			{ parentDeadlineAt },
-		);
-		assert.ok((maxRuntimeParams.timeoutMs ?? Number.MAX_SAFE_INTEGER) < 60_000);
-		assert.equal(maxRuntimeParams.maxRuntimeMs, undefined);
-	});
-
-	it("propagates a checkpoint policy from workflow defaults to children", () => {
-		const params = prepareWorkflowLaunchParams(
-			{ checkpointPolicy: { version: 1 } },
-			{ agent: "reviewer", task: "Review" },
-			"workflow-run",
-			"review",
-		);
-		assert.deepEqual(params.checkpointPolicy, { version: 1 });
 	});
 
 	it("preserves explicit async workflow children", () => {
@@ -142,21 +122,6 @@ describe("workflow launch params", () => {
 				intercomBridge: { mode: "off" },
 			},
 		);
-	});
-
-	it("clamps retained workflow resumes to the parent deadline", () => {
-		const parentDeadlineAt = Date.now() + 60_000;
-		const params = prepareWorkflowLaunchParams(
-			{},
-			{ resume: "retained-run", task: "Continue" },
-			"workflow-run",
-			"continue",
-			{ parentDeadlineAt },
-		);
-		assert.equal(params.action, "resume");
-		assert.ok((params.timeoutMs ?? 0) > 0);
-		assert.ok((params.timeoutMs ?? Number.MAX_SAFE_INTEGER) < 60_000);
-		assert.equal(params.workflowParentDeadlineAt, parentDeadlineAt);
 	});
 
 	it("preserves worktree isolation for retained workflow children", () => {

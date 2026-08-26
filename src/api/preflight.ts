@@ -11,7 +11,7 @@ import { applyThinkingSuffix, resolvePiLaunchToolPlan, type PiLaunchToolPlan } f
 import { injectOutputPathSystemPrompt, normalizeSingleOutputOverride, resolveSingleOutputPath } from "../runs/shared/single-output.ts";
 import { getArtifactPaths, getArtifactsDir } from "../shared/artifacts.ts";
 import { resolveEffectiveThinking } from "../shared/model-info.ts";
-import { SUBAGENT_LIFECYCLE_ARTIFACT_VERSION, type ArtifactDirPreference, type ArtifactPaths, type JsonSchemaObject, type OutputMode, type ReviewCheckpointPolicy } from "../shared/types.ts";
+import { SUBAGENT_LIFECYCLE_ARTIFACT_VERSION, type ArtifactDirPreference, type ArtifactPaths, type JsonSchemaObject, type OutputMode, type ReviewCheckpointPolicy, type ReviewCheckpointPolicyInput } from "../shared/types.ts";
 import { capabilityCeilingAgentRestrictionMessage, intersectSubagentCapabilityCeilings, type ResolvedSubagentCapabilityCeiling, type SubagentCapabilityAudit } from "../runs/shared/capability-ceiling.ts";
 import { appendTurnBudgetSystemPrompt } from "../runs/shared/turn-budget.ts";
 import { validateCheckpointPolicy } from "../runs/shared/review-checkpoint.ts";
@@ -60,7 +60,7 @@ export interface SubagentLaunchContractInput {
 	outputMode?: OutputMode;
 	outputSchema?: JsonSchemaObject;
 	turnBudget?: ResolvedTurnBudget;
-	checkpointPolicy?: ReviewCheckpointPolicy;
+	checkpointPolicy?: ReviewCheckpointPolicyInput;
 	artifacts?: boolean;
 	artifactDir?: ArtifactDirPreference;
 	parentSessionFile?: string | null;
