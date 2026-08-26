@@ -38,6 +38,7 @@ export interface RunnerSubagentStep {
 	/** Defer the authoritative output instruction until a dynamic fanout item is materialized. */
 	namespaceOutputPath?: boolean;
 	outputMode?: "inline" | "file-only";
+	checkpointPolicy?: import("../../shared/types.ts").ReviewCheckpointPolicy;
 	sessionFile?: string;
 	maxSubagentDepth?: number;
 	timeoutMs?: number;

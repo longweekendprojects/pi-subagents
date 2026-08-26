@@ -26,6 +26,7 @@ import { resolveSubagentLaunchContract } from "../../src/api/preflight.ts";
 import { discoverAgents } from "../../src/agents/agents.ts";
 import { runSync } from "../../src/runs/foreground/execution.ts";
 import { ACTIVE_ASYNC_CAPACITY_DIR, acquireActiveAsyncCapacity, activeAsyncCapacitySessionKey } from "../../src/runs/background/active-async-capacity.ts";
+import { persistReviewCheckpoint } from "../../src/runs/shared/review-checkpoint.ts";
 
 interface LaunchResolvedExtensions {
 	version?: number;
@@ -615,21 +616,36 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		const agentName = `contract-worker-${Date.now().toString(36)}`;
 		const task = "Compare the resolved launch inputs.";
 		const turnBudget = { maxTurns: 2, graceTurns: 1 } as const;
+		const checkpointPolicy = { version: 1 } as const;
 		const agentPath = path.join(tempDir, ".pi", "agents", `${agentName}.md`);
 		fs.mkdirSync(path.dirname(agentPath), { recursive: true });
 		fs.writeFileSync(agentPath, `---\nname: ${agentName}\ndescription: Contract comparison worker\n---\n`, "utf-8");
 		const discovered = discoverAgents(tempDir).agents.find((agent) => agent.name === agentName);
 		assert.ok(discovered, "expected temporary agent definition to be discovered");
-		const preflight = await resolveSubagentLaunchContract({ agent: agentName, cwd: tempDir, task, turnBudget, runId: "contract-preflight" });
+		const preflight = await resolveSubagentLaunchContract({ agent: agentName, cwd: tempDir, task, turnBudget, checkpointPolicy, runId: "contract-preflight" });
 		assert.equal(preflight.ok, true);
 
+		const foregroundStore = path.join(tempDir, "foreground-checkpoint.json");
+		persistReviewCheckpoint({
+			storePath: foregroundStore,
+			identity: { runId: "contract-foreground", agent: agentName, childIndex: 0 },
+			assistantTurn: 1,
+			submission: { reviewFindings: [], residualRisks: [] },
+		});
 		mockPi.onCall({ output: "foreground contract comparison" });
-		const foreground = await runSync(tempDir, [discovered], agentName, task, { runId: "contract-foreground", acceptance: false, turnBudget });
+		const foreground = await runSync(tempDir, [discovered], agentName, task, { runId: "contract-foreground", acceptance: false, turnBudget, checkpointPolicy, reviewCheckpointStorePath: foregroundStore });
 		assert.equal(foreground.exitCode, 0);
+		assert.deepEqual(foreground.reviewFindings, []);
 		assert.equal(foreground.launchContractDigest, preflight.contract.launchContractDigest);
 
 		mockPi.onCall({ output: "async contract comparison" });
 		const asyncId = `async-contract-equivalence-${Date.now().toString(36)}`;
+		persistReviewCheckpoint({
+			storePath: path.join(ASYNC_DIR, asyncId, "review-checkpoints", `${asyncId}-0.json`),
+			identity: { runId: asyncId, agent: agentName, childIndex: 0 },
+			assistantTurn: 1,
+			submission: { reviewFindings: [], residualRisks: [] },
+		});
 		const launch = executeAsyncSingle(asyncId, {
 			agent: agentName,
 			task,
@@ -641,11 +657,13 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			maxSubagentDepth: 2,
 			acceptance: false,
 			turnBudget,
+			checkpointPolicy,
 		});
 		const payload = await readAsyncPayload(asyncId);
 		assert.equal(launch.details.launchContractDigest, preflight.contract.launchContractDigest);
 		assert.equal(payload.launchContractDigest, preflight.contract.launchContractDigest);
 		assert.equal(payload.results[0]?.launchContractDigest, preflight.contract.launchContractDigest);
+		assert.deepEqual((payload.results[0] as { reviewFindings?: string[] } | undefined)?.reviewFindings, foreground.reviewFindings);
 	});
 
 	it("persists the actual launch digest in async status and result metadata", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {

@@ -6,9 +6,20 @@ import { registerNativeSupervisorClient } from "../../intercom/native-supervisor
 import { shouldUseNativeFsWatch } from "../../shared/watch-strategy.ts";
 import { decodePermissionRules, permissionDecision, PERMISSION_AUDIT_PATH_ENV, PERMISSION_POLICY_ENV } from "./permissions.ts";
 import { consumeSteerRequestsFromDir, MAX_STEER_QUEUE_SIZE, steerAckPathFromDir, writeSteerAckAt, writeSteerCapabilityAt, writeSteerRequestToDir, type SteerDeliveryStatus, type SteerRequest } from "../background/control-channel.ts";
-import { SUBAGENT_CHILD_AGENT_ENV, SUBAGENT_CHILD_INDEX_ENV, SUBAGENT_FANOUT_CHILD_ENV, SUBAGENT_STEER_ACK_DIR_ENV, SUBAGENT_STEER_CAPABILITY_ENV, SUBAGENT_STEER_INBOX_ENV } from "./pi-args.ts";
+import { SUBAGENT_CHILD_AGENT_ENV, SUBAGENT_CHILD_INDEX_ENV, SUBAGENT_FANOUT_CHILD_ENV, SUBAGENT_RUN_ID_ENV, SUBAGENT_STEER_ACK_DIR_ENV, SUBAGENT_STEER_CAPABILITY_ENV, SUBAGENT_STEER_INBOX_ENV } from "./pi-args.ts";
 import { RUNTIME_EXTENSION_ACK_EVENT, RUNTIME_EXTENSION_ACK_PATH_ENV, isRuntimeAcknowledgedExtensionId, writeRuntimeAcknowledgedExtensions } from "./runtime-acknowledged-extensions.ts";
 import { createStructuredOutputToolParameters, STRUCTURED_OUTPUT_CAPTURE_ENV, STRUCTURED_OUTPUT_SCHEMA_ENV, validateStructuredOutputValue } from "./structured-output.ts";
+import {
+	REVIEW_CHECKPOINT_FINALIZATION_RESERVE_TURNS,
+	REVIEW_CHECKPOINT_GATE_TURN,
+	REVIEW_CHECKPOINT_PARAMETERS_SCHEMA,
+	REVIEW_CHECKPOINT_POLICY_ENV,
+	REVIEW_CHECKPOINT_STORE_ENV,
+	REVIEW_CHECKPOINT_TOOL_NAME,
+	persistReviewCheckpoint,
+	validateCheckpointPolicy,
+	validateReviewCheckpointSubmission,
+} from "./review-checkpoint.ts";
 import {
 	CHILD_TOOL_DIAGNOSTIC_PATH_ENV,
 	MCP_DIRECT_CHILD_TOOLS_ENV,
@@ -38,6 +49,12 @@ const STRUCTURED_OUTPUT_INSTRUCTIONS = [
 	"This subagent step has a strict structured output contract.",
 	"Your final action must be to call the `structured_output` tool with JSON matching the provided schema.",
 	"Do not rely on prose-only completion; if you do not call `structured_output`, the parent will fail this step.",
+].join("\n");
+
+const REVIEW_CHECKPOINT_INSTRUCTIONS = [
+	"This subagent step requires a durable review checkpoint before its third assistant turn.",
+	"Call `review_checkpoint` with complete reviewFindings and residualRisks arrays. Use [] only when the review is clean or has no residual risks.",
+	"The checkpoint is accepted only after the tool confirms it persisted. Do not rely on prose or a tool start as evidence.",
 ].join("\n");
 
 export const CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS = [
@@ -189,7 +206,8 @@ export function rewriteSubagentPrompt(
 	rewritten = stripChildBoundaryInstructions(rewritten);
 	const boundary = options.fanoutChild ? CHILD_FANOUT_BOUNDARY_INSTRUCTIONS : CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS;
 	const structured = process.env[STRUCTURED_OUTPUT_CAPTURE_ENV] ? `\n\n${STRUCTURED_OUTPUT_INSTRUCTIONS}` : "";
-	return `${boundary}${structured}\n\n${rewritten}`;
+	const checkpoint = process.env[REVIEW_CHECKPOINT_POLICY_ENV] ? `\n\n${REVIEW_CHECKPOINT_INSTRUCTIONS}` : "";
+	return `${boundary}${structured}${checkpoint}\n\n${rewritten}`;
 }
 
 function isParentOnlySubagentMessage(message: unknown): boolean {
@@ -306,6 +324,86 @@ export function registerPermissionGate(
 		});
 		if (result.approved) return undefined;
 		return { block: true, reason: `Blocked by pi-subagents permission rule: ${result.reason}` };
+	});
+}
+
+function registerReviewCheckpoint(pi: ExtensionAPI): void {
+	const rawPolicy = process.env[REVIEW_CHECKPOINT_POLICY_ENV]?.trim();
+	if (!rawPolicy) return;
+	let policy: ReturnType<typeof validateCheckpointPolicy>["policy"];
+	try {
+		policy = validateCheckpointPolicy(JSON.parse(rawPolicy)).policy;
+	} catch {
+		policy = undefined;
+	}
+	const storePath = process.env[REVIEW_CHECKPOINT_STORE_ENV]?.trim();
+	const runId = process.env[SUBAGENT_RUN_ID_ENV]?.trim();
+	const agent = process.env[SUBAGENT_CHILD_AGENT_ENV]?.trim();
+	const childIndex = Number(process.env[SUBAGENT_CHILD_INDEX_ENV]);
+	if (!policy || !storePath || !runId || !agent || !Number.isInteger(childIndex) || childIndex < 0) {
+		throw new Error("Invalid review checkpoint runtime configuration.");
+	}
+	let assistantTurn = 0;
+	let checkpointCompleted = false;
+	const onRuntimeEvent = pi.on as unknown as (event: string, handler: (event: { toolName?: unknown; message?: { role?: unknown } }) => unknown) => void;
+	onRuntimeEvent("message_end", (event) => {
+		if (event.message?.role === "assistant") assistantTurn++;
+		return undefined;
+	});
+	onRuntimeEvent("tool_call", (event) => {
+		if (assistantTurn < REVIEW_CHECKPOINT_GATE_TURN || checkpointCompleted) return undefined;
+		const toolName = typeof event.toolName === "string" ? event.toolName : "tool";
+		const finalizationReserveTurn = REVIEW_CHECKPOINT_GATE_TURN + REVIEW_CHECKPOINT_FINALIZATION_RESERVE_TURNS - 1;
+		if (assistantTurn > finalizationReserveTurn) {
+			return {
+				block: true,
+				reason: `Review checkpoint finalization reserve expired after assistant turn ${finalizationReserveTurn}; no tools may run without a persisted checkpoint.`,
+			};
+		}
+		const allowed = toolName === REVIEW_CHECKPOINT_TOOL_NAME
+			|| (toolName === "structured_output" && Boolean(process.env[STRUCTURED_OUTPUT_CAPTURE_ENV]));
+		return allowed
+			? undefined
+			: {
+				block: true,
+				reason: `Review checkpoint finalization reserve is active at assistant turn ${assistantTurn}. Only '${REVIEW_CHECKPOINT_TOOL_NAME}'${process.env[STRUCTURED_OUTPUT_CAPTURE_ENV] ? " and 'structured_output'" : ""} may run until a checkpoint persists.`,
+			};
+	});
+	if (typeof pi.registerTool !== "function") return;
+	const registerTool = pi.registerTool as unknown as (tool: {
+		name: string;
+		label: string;
+		description: string;
+		parameters: unknown;
+		execute: (_id: string, params: { value: unknown }) => Promise<unknown>;
+	}) => void;
+	registerTool({
+		name: REVIEW_CHECKPOINT_TOOL_NAME,
+		label: "Review Checkpoint",
+		description: "Persist complete review findings and residual risks before finalization. This is acknowledged only after durable persistence.",
+		parameters: createStructuredOutputToolParameters(REVIEW_CHECKPOINT_PARAMETERS_SCHEMA) as never,
+		async execute(_id: string, params: { value: unknown }) {
+			const schemaValidation = await validateStructuredOutputValue(REVIEW_CHECKPOINT_PARAMETERS_SCHEMA, params.value);
+			if (schemaValidation.status === "invalid") throw new Error(`Review checkpoint validation failed: ${schemaValidation.message}`);
+			const submission = validateReviewCheckpointSubmission(params.value);
+			if (!submission.submission) throw new Error(submission.error ?? "Review checkpoint validation failed.");
+			let record;
+			try {
+				record = persistReviewCheckpoint({
+					storePath,
+					identity: { runId, agent, childIndex },
+					assistantTurn: Math.max(1, assistantTurn),
+					submission: submission.submission,
+				});
+			} catch (error) {
+				throw new Error(`Review checkpoint persistence failed: ${error instanceof Error ? error.message : String(error)}`);
+			}
+			checkpointCompleted = true;
+			return {
+				content: [{ type: "text", text: "Review checkpoint persisted." }],
+				details: { reviewCheckpoint: record },
+			};
+		},
 	});
 }
 
@@ -566,6 +664,7 @@ export function registerSteeringInbox(
 export default function registerSubagentPromptRuntime(pi: ExtensionAPI): void {
 	registerRuntimeExtensionAcknowledgements(pi);
 	registerSteeringInbox(pi);
+	registerReviewCheckpoint(pi);
 	registerPermissionGate(pi);
 	registerToolBudget(pi, decodeToolBudgetEnv(process.env[TOOL_BUDGET_ENV], { allowZero: process.env[TOOL_BUDGET_ZERO_AUTH_ENV] === "1" }));
 	registerChildWatchdog(pi);

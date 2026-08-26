@@ -106,6 +106,10 @@ const TurnBudgetOverride = Type.Object({
 	graceTurns: Type.Optional(Type.Integer({ minimum: 0 })),
 }, { additionalProperties: false, description: "Optional assistant-turn budget. At maxTurns the child is asked to wrap up; after graceTurns additional assistant turns it is aborted and partial output is returned." });
 
+const CheckpointPolicyOverride = Type.Object({
+	version: Type.Integer({ minimum: 1, maximum: 1 }),
+}, { additionalProperties: false, description: "Opt in to durable review checkpoints. Version 1 requires a checkpoint before assistant turn 3 and reserves finalization tools until it persists." });
+
 const ToolBudgetBlock = Type.Unsafe({
 	anyOf: [
 		{ type: "array", minItems: 1, items: { type: "string", minLength: 1 } },
@@ -145,6 +149,7 @@ export const ParallelTaskSchema = Type.Object({
 	progress: Type.Optional(Type.Boolean({ description: "Enable progress.md tracking in {chain_dir}" })),
 	skill: Type.Optional(SkillOverride),
 	model: Type.Optional(Type.String({ description: "Override model for this task" })),
+	checkpointPolicy: Type.Optional(CheckpointPolicyOverride),
 	toolBudget: Type.Optional(ToolBudgetOverride),
 	acceptance: Type.Optional(AcceptanceOverride),
 	agentContract: Type.Optional(AgentContractOverride),
@@ -175,6 +180,7 @@ export const DynamicParallelTemplateSchema = Type.Object({
 	progress: Type.Optional(Type.Boolean({ description: "Enable progress.md tracking in {chain_dir}" })),
 	skill: Type.Optional(SkillOverride),
 	model: Type.Optional(Type.String({ description: "Override model for this task" })),
+	checkpointPolicy: Type.Optional(CheckpointPolicyOverride),
 	toolBudget: Type.Optional(ToolBudgetOverride),
 	acceptance: Type.Optional(AcceptanceOverride),
 	agentContract: Type.Optional(AgentContractOverride),
@@ -203,6 +209,7 @@ export const ChainItem = Type.Object({
 	progress: Type.Optional(Type.Boolean({ description: "Enable progress.md tracking in {chain_dir}" })),
 	skill: Type.Optional(SkillOverride),
 	model: Type.Optional(Type.String({ description: "Override model for this step" })),
+	checkpointPolicy: Type.Optional(CheckpointPolicyOverride),
 	toolBudget: Type.Optional(ToolBudgetOverride),
 	acceptance: Type.Optional(AcceptanceOverride),
 	agentContract: Type.Optional(AgentContractOverride),
@@ -320,6 +327,7 @@ const SubagentParamProperties = {
 	maxRuntimeMs: Type.Optional(Type.Integer({ minimum: 1, description: "Alias timeoutMs. Foreground and single async runs use config timeoutMs, else 30m; async composites have no default parent deadline." })),
 	toolTimeoutMs: Type.Optional(Type.Integer({ minimum: 1, description: "Optional hard per-tool-call timeout in milliseconds; known-fast built-in tools have a five-minute default." })),
 	turnBudget: Type.Optional(TurnBudgetOverride),
+	checkpointPolicy: Type.Optional(CheckpointPolicyOverride),
 	toolBudget: Type.Optional(ToolBudgetOverride),
 	usageBudget: Type.Optional(UsageBudgetOverride),
 	agentScope: Type.Optional(Type.String({ description: "Agent discovery scope: 'user', 'project', or 'both' (default: 'both'; project wins on name collisions)" })),

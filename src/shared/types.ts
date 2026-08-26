@@ -100,6 +100,24 @@ export interface TurnBudgetConfig {
 	graceTurns?: number;
 }
 
+/** Opt-in durable review checkpoint protocol. Its turn gate and reserve are fixed by version 1. */
+export interface ReviewCheckpointPolicy {
+	version: 1;
+}
+
+/** A validated, persist-before-acknowledgement review checkpoint from one child runtime. */
+export interface ReviewCheckpointRecord {
+	version: 1;
+	runId: string;
+	childIndex: number;
+	agent: string;
+	sequence: number;
+	timestamp: string;
+	assistantTurn: number;
+	reviewFindings: string[];
+	residualRisks: string[];
+}
+
 export interface ResolvedTurnBudget {
 	maxTurns: number;
 	graceTurns: number;
@@ -301,10 +319,24 @@ export type ChainGateLayer = "execution" | "acceptance";
 
 export type ExecutionProjectionStatus = "completed" | "failed" | "paused" | "stopped" | "detached";
 
+/** The authoritative lifecycle reason, independent of compatibility booleans such as timedOut and stopped. */
+export type TerminalCause =
+	| "completed"
+	| "explicit-stop"
+	| "workflow-deadline"
+	| "interrupt"
+	| "turn-budget"
+	| "tool-timeout"
+	| "protocol-failure"
+	| "process-signal"
+	| "process-failure"
+	| "spawn-failure";
+
 export interface ExecutionProjection {
 	status: ExecutionProjectionStatus;
 	success: boolean;
 	exitCode: number;
+	terminalCause?: TerminalCause;
 	error?: string;
 	interrupted?: boolean;
 	timedOut?: boolean;
@@ -531,6 +563,7 @@ export interface SteeringRecoveryDescriptor {
 	/** Raw per-run bridge override. Omitted descriptors continue to use global config. */
 	intercomBridge?: IntercomBridgeConfig;
 	absoluteDeadlineAt?: number;
+	checkpointPolicy?: ReviewCheckpointPolicy;
 	initialTurnBudget?: ResolvedTurnBudget;
 	initialToolBudget?: ResolvedToolBudget;
 	maxSubagentDepth: number;
@@ -545,7 +578,7 @@ export interface SteeringRecoveryDescriptor {
 
 export type PublicNestedStepSummary = Pick<
 	NestedStepSummary,
-	"agent" | "status" | "model" | "thinking" | "sessionFile" | "transcriptPath" | "transcriptError" | "activityState" | "lastActivityAt" | "currentTool" | "currentToolStartedAt" | "currentPath" | "turnCount" | "toolCount" | "toolBudget" | "toolBudgetBlocked" | "startedAt" | "endedAt" | "error" | "timedOut" | "stopped"
+	"agent" | "status" | "model" | "thinking" | "sessionFile" | "transcriptPath" | "transcriptError" | "activityState" | "lastActivityAt" | "currentTool" | "currentToolStartedAt" | "currentPath" | "turnCount" | "toolCount" | "toolBudget" | "toolBudgetBlocked" | "startedAt" | "endedAt" | "error" | "timedOut" | "stopped" | "terminalCause" | "checkpointPolicy" | "reviewCheckpoints" | "reviewFindings" | "residualRisks"
 > & {
 	children?: PublicNestedRunSummary[];
 };
@@ -558,7 +591,7 @@ export type CostSummary = {
 
 export type PublicNestedRunSummary = Pick<
 	NestedRunSummary,
-	"id" | "parentRunId" | "parentStepIndex" | "parentAgent" | "depth" | "path" | "asyncDir" | "sessionId" | "sessionFile" | "intercomTarget" | "ownerIntercomTarget" | "leafIntercomTarget" | "ownerState" | "mode" | "state" | "agent" | "agents" | "model" | "thinking" | "currentStep" | "chainStepCount" | "parallelGroups" | "activityState" | "lastActivityAt" | "currentTool" | "currentToolStartedAt" | "currentPath" | "turnCount" | "toolCount" | "toolBudget" | "toolBudgetBlocked" | "totalTokens" | "totalCost" | "startedAt" | "endedAt" | "lastUpdate" | "error" | "timeoutMs" | "deadlineAt" | "timedOut" | "stopped" | "turnBudget" | "turnBudgetExceeded" | "wrapUpRequested"
+	"id" | "parentRunId" | "parentStepIndex" | "parentAgent" | "depth" | "path" | "asyncDir" | "sessionId" | "sessionFile" | "intercomTarget" | "ownerIntercomTarget" | "leafIntercomTarget" | "ownerState" | "mode" | "state" | "agent" | "agents" | "model" | "thinking" | "currentStep" | "chainStepCount" | "parallelGroups" | "activityState" | "lastActivityAt" | "currentTool" | "currentToolStartedAt" | "currentPath" | "turnCount" | "toolCount" | "toolBudget" | "toolBudgetBlocked" | "totalTokens" | "totalCost" | "startedAt" | "endedAt" | "lastUpdate" | "error" | "timeoutMs" | "deadlineAt" | "timedOut" | "stopped" | "terminalCause" | "checkpointPolicy" | "reviewCheckpoints" | "reviewFindings" | "residualRisks" | "turnBudget" | "turnBudgetExceeded" | "wrapUpRequested"
 > & {
 	steps?: PublicNestedStepSummary[];
 	children?: PublicNestedRunSummary[];
@@ -916,6 +949,12 @@ export interface SingleResult {
 	interrupted?: boolean;
 	timedOut?: boolean;
 	stopped?: boolean;
+	terminalCause?: TerminalCause;
+	checkpointPolicy?: ReviewCheckpointPolicy;
+	reviewCheckpoints?: ReviewCheckpointRecord[];
+	/** Present only when a validated checkpoint explicitly supplied findings, including []. */
+	reviewFindings?: string[];
+	residualRisks?: string[];
 	turnBudget?: TurnBudgetState;
 	turnBudgetExceeded?: boolean;
 	wrapUpRequested?: boolean;
@@ -1037,6 +1076,8 @@ export interface Details {
 	deadlineAt?: number;
 	timedOut?: boolean;
 	stopped?: boolean;
+	terminalCause?: TerminalCause;
+	checkpointPolicy?: ReviewCheckpointPolicy;
 	turnBudget?: ResolvedTurnBudget;
 	toolBudget?: ResolvedToolBudget;
 	usageBudget?: UsageBudgetState;
@@ -1184,6 +1225,11 @@ export interface NestedStepSummary {
 	watchdog?: ChildWatchdogProgress;
 	timedOut?: boolean;
 	stopped?: boolean;
+	terminalCause?: TerminalCause;
+	checkpointPolicy?: ReviewCheckpointPolicy;
+	reviewCheckpoints?: ReviewCheckpointRecord[];
+	reviewFindings?: string[];
+	residualRisks?: string[];
 	turnBudget?: TurnBudgetState;
 	turnBudgetExceeded?: boolean;
 	wrapUpRequested?: boolean;
@@ -1240,6 +1286,11 @@ export interface NestedRunSummary extends NestedRunAddress {
 	deadlineAt?: number;
 	timedOut?: boolean;
 	stopped?: boolean;
+	terminalCause?: TerminalCause;
+	checkpointPolicy?: ReviewCheckpointPolicy;
+	reviewCheckpoints?: ReviewCheckpointRecord[];
+	reviewFindings?: string[];
+	residualRisks?: string[];
 	turnBudget?: TurnBudgetState;
 	turnBudgetExceeded?: boolean;
 	wrapUpRequested?: boolean;
@@ -1283,6 +1334,8 @@ export interface AsyncStartedEvent {
 	usageBudget?: UsageBudgetState;
 	timeoutMs?: number;
 	deadlineAt?: number;
+	checkpointPolicy?: ReviewCheckpointPolicy;
+	terminalCause?: TerminalCause;
 	turnBudget?: TurnBudgetState;
 	nestedRoute?: NestedRouteInfo;
 	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
@@ -1388,6 +1441,11 @@ export interface AsyncStatus {
 	deadlineAt?: number;
 	timedOut?: boolean;
 	stopped?: boolean;
+	terminalCause?: TerminalCause;
+	checkpointPolicy?: ReviewCheckpointPolicy;
+	reviewCheckpoints?: ReviewCheckpointRecord[];
+	reviewFindings?: string[];
+	residualRisks?: string[];
 	turnBudget?: TurnBudgetState;
 	turnBudgetExceeded?: boolean;
 	wrapUpRequested?: boolean;
@@ -1456,6 +1514,11 @@ export interface AsyncStatus {
 		exitCode?: number | null;
 		timedOut?: boolean;
 		stopped?: boolean;
+		terminalCause?: TerminalCause;
+		checkpointPolicy?: ReviewCheckpointPolicy;
+		reviewCheckpoints?: ReviewCheckpointRecord[];
+		reviewFindings?: string[];
+		residualRisks?: string[];
 		turnBudget?: TurnBudgetState;
 		turnBudgetExceeded?: boolean;
 		wrapUpRequested?: boolean;
@@ -1542,6 +1605,8 @@ export interface AsyncJobState {
 	deadlineAt?: number;
 	timedOut?: boolean;
 	stopped?: boolean;
+	terminalCause?: TerminalCause;
+	checkpointPolicy?: ReviewCheckpointPolicy;
 	turnBudget?: TurnBudgetState;
 	turnBudgetExceeded?: boolean;
 	wrapUpRequested?: boolean;
@@ -1814,6 +1879,9 @@ export interface RunSyncOptions {
 	/** Raw global config.toolTimeoutMs, used by the per-child resolver. */
 	configToolTimeoutMs?: number;
 	turnBudget?: ResolvedTurnBudget;
+	checkpointPolicy?: ReviewCheckpointPolicy;
+	/** Durable private checkpoint store supplied by the parent runner. */
+	reviewCheckpointStorePath?: string;
 	usageBudget?: UsageBudgetConfig;
 	/** Enforce maxTurns + graceTurns as a hard model-turn boundary. */
 	enforceHardTurnLimit?: boolean;
@@ -2009,6 +2077,7 @@ export interface ExtensionConfig {
 	control?: ControlConfig;
 	completionBatch?: CompletionBatchConfig;
 	turnBudget?: TurnBudgetConfig;
+	checkpointPolicy?: ReviewCheckpointPolicy;
 	toolBudget?: ToolBudgetConfig;
 	/** Opt-in native tool permissions. Bash remains outside this policy. */
 	permissions?: import("../runs/shared/permissions.ts").PermissionConfig;

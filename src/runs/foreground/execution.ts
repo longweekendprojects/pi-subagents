@@ -26,6 +26,7 @@ import {
 	type SingleResult,
 	type Usage,
 	DEFAULT_MAX_OUTPUT,
+	TEMP_ROOT_DIR,
 	INTERCOM_DETACH_REQUEST_EVENT,
 	INTERCOM_DETACH_RESPONSE_EVENT,
 	type AcceptanceLedger,
@@ -98,6 +99,7 @@ import { acceptanceFailureMessage, buildSkippedAcceptanceLedger, evaluateAccepta
 import { PROMPT_REDACTED } from "../../shared/utils.ts";
 import { attachContractProjections, isAgentContractV1 } from "../shared/agent-contract.ts";
 import { appendTurnBudgetSystemPrompt, formatTurnBudgetOutput, initialTurnBudgetState, turnBudgetDecision, turnBudgetDeferredNote, turnBudgetDeferredState, turnBudgetExceededMessage, turnBudgetSoftNote, turnBudgetState } from "../shared/turn-budget.ts";
+import { checkpointStorePath, projectCheckpointEvidence, salvageReviewCheckpoints } from "../shared/review-checkpoint.ts";
 import { initialToolBudgetState, toolBudgetState } from "../shared/tool-budget.ts";
 import { resolveWatchdogConfig } from "../../watchdog/settings.ts";
 import { agentDefinitionDigest, launchBindingDigest } from "../../shared/launch-contract.ts";
@@ -154,6 +156,11 @@ function persistSingleResultMetadata(input: {
 		task: PROMPT_REDACTED,
 		exitCode: target.exitCode,
 		processSignal: target.processSignal,
+		terminalCause: target.terminalCause,
+		checkpointPolicy: target.checkpointPolicy,
+		reviewCheckpoints: target.reviewCheckpoints,
+		reviewFindings: target.reviewFindings,
+		residualRisks: target.residualRisks,
 		usage: target.usage,
 		model: target.model,
 		attemptedModels: target.attemptedModels,
@@ -360,6 +367,8 @@ async function runSingleAttempt(
 		steerCapabilityPath: options.steerCapabilityPath,
 		steerAckDir: options.steerAckDir,
 		structuredOutput: options.structuredOutput,
+		checkpointPolicy: options.checkpointPolicy,
+		reviewCheckpointStorePath: options.reviewCheckpointStorePath,
 		toolBudget: options.toolBudget,
 		allowZeroToolBudget: options.allowZeroToolBudget,
 		permissionRules,
@@ -378,6 +387,7 @@ async function runSingleAttempt(
 		cwd: options.cwd ?? runtimeCwd,
 		requireReadTool: Boolean(shared.resolvedSkillNames?.length),
 		structuredOutput: Boolean(options.structuredOutput),
+		checkpointPolicy: options.checkpointPolicy,
 		capabilityCeiling: options.capabilityCeiling,
 		inheritedCapabilityCeiling: decodeSubagentCapabilityCeiling(process.env[SUBAGENT_CAPABILITY_CEILING_ENV]),
 		agentName: agent.name,
@@ -399,6 +409,7 @@ async function runSingleAttempt(
 		mcpDirectTools: toolPlan.effectiveMcpTools,
 		...(options.outputPath ? { outputPath: options.outputPath } : {}),
 		outputMode: options.outputMode ?? "inline",
+		...(options.checkpointPolicy ? { checkpointPolicy: options.checkpointPolicy } : {}),
 		...(options.structuredOutput ? { structuredOutputSchema: options.structuredOutput.schema } : {}),
 	});
 	const result: SingleResult = withRunContext({
@@ -419,6 +430,7 @@ async function runSingleAttempt(
 		skills: shared.resolvedSkillNames,
 		skillsWarning: shared.skillsWarning,
 		...(options.turnBudget ? { turnBudget: initialTurnBudgetState(options.turnBudget) } : {}),
+		...(options.checkpointPolicy ? { checkpointPolicy: options.checkpointPolicy } : {}),
 		...(options.toolBudget ? { toolBudget: initialToolBudgetState(options.toolBudget) } : {}),
 		...(options.capabilityCeiling ? { capabilityCeiling: options.capabilityCeiling } : {}),
 		...(capabilityAudit ? { capabilityAudit } : {}),
@@ -467,6 +479,7 @@ async function runSingleAttempt(
 		cleanupTempDir(tempDir);
 		result.exitCode = 1;
 		result.timedOut = true;
+		result.terminalCause = "workflow-deadline";
 		result.error = attemptTimeout.message;
 		result.finalOutput = attemptTimeout.message;
 		progress.status = "failed";
@@ -503,6 +516,7 @@ async function runSingleAttempt(
 		let timeoutTimer: NodeJS.Timeout | undefined;
 		let timeoutTerminationTimer: NodeJS.Timeout | undefined;
 		let timeoutHardKillTimer: NodeJS.Timeout | undefined;
+		let abortHardKillTimer: NodeJS.Timeout | undefined;
 		let turnBudgetSoftReached = false;
 		let turnBudgetTerminationTimer: NodeJS.Timeout | undefined;
 		let turnBudgetHardKillTimer: NodeJS.Timeout | undefined;
@@ -677,6 +691,10 @@ async function runSingleAttempt(
 			clearTimeoutTimers();
 			clearAllToolTimeouts();
 			clearTurnBudgetTimers();
+			if (abortHardKillTimer) {
+				clearTimeout(abortHardKillTimer);
+				abortHardKillTimer = undefined;
+			}
 			if (protocolHardKillTimer) {
 				clearTimeout(protocolHardKillTimer);
 				protocolHardKillTimer = undefined;
@@ -819,6 +837,7 @@ async function runSingleAttempt(
 			if (!budget || result.timedOut || result.turnBudgetExceeded || interruptedByControl || processClosed || lifecycleFinished) return;
 			const message = turnBudgetExceededMessage(budget, turnCount);
 			result.turnBudgetExceeded = true;
+			result.terminalCause = "turn-budget";
 			result.wrapUpRequested = true;
 			result.turnBudget = turnBudgetState(budget, turnCount, true);
 			result.error = message;
@@ -925,9 +944,9 @@ async function runSingleAttempt(
 		const processLine = (line: string) => {
 			if (!line.trim()) return;
 			jsonlWriter.writeLine(line);
-			let evt: { type?: string; message?: Message; toolName?: string; toolCallId?: string; args?: unknown; willRetry?: unknown };
+			let evt: { type?: string; message?: Message; toolName?: string; toolCallId?: string; args?: unknown; details?: unknown; willRetry?: unknown };
 			try {
-				evt = JSON.parse(line) as { type?: string; message?: Message; toolName?: string; toolCallId?: string; args?: unknown; willRetry?: unknown };
+				evt = JSON.parse(line) as { type?: string; message?: Message; toolName?: string; toolCallId?: string; args?: unknown; details?: unknown; willRetry?: unknown };
 			} catch {
 				rawStdoutTail.push(`${line}\n`);
 				shared.transcriptWriter?.writeStdoutLine(line);
@@ -1098,6 +1117,7 @@ async function runSingleAttempt(
 			timeoutTimer = setTimeout(() => {
 				if (processClosed || lifecycleFinished || interruptedByControl) return;
 				result.timedOut = true;
+				result.terminalCause = "workflow-deadline";
 				clearAllToolTimeouts();
 				result.error = attemptTimeout.message;
 				result.finalOutput = attemptTimeout.message;
@@ -1158,6 +1178,7 @@ async function runSingleAttempt(
 		const terminateForToolTimeout = (message: string): void => {
 			if (processClosed || lifecycleFinished || interruptedByControl) return;
 			result.timedOut = true;
+			result.terminalCause = "tool-timeout";
 			result.error = message;
 			result.finalOutput = message;
 			progress.status = "failed";
@@ -1199,6 +1220,7 @@ async function runSingleAttempt(
 		const failProtocol = (limit: ProtocolOutputLimit): void => {
 			if (result.protocolError) return;
 			result.protocolError = limit;
+			result.terminalCause = "protocol-failure";
 			result.error = formatProtocolOutputLimit(limit);
 			progress.status = "failed";
 			progress.error = result.error;
@@ -1271,10 +1293,14 @@ async function runSingleAttempt(
 			}
 			const finalCode = forcedDrainAfterFinalSuccess ? 0 : forcedTerminationSignal || signal ? (code ?? 1) : (code ?? 0);
 			if (!result.error && closeError) result.error = closeError;
+			if (!result.terminalCause) {
+				result.terminalCause = signal ? "process-signal" : finalCode === 0 && !result.error ? "completed" : "process-failure";
+			}
 			finish(finalCode);
 		});
 		proc.on("error", (error) => {
 			if (lifecycleFinished) return;
+			result.terminalCause = "spawn-failure";
 			processClosed = true;
 			clearFinalDrainTimers();
 			clearStdioGuard();
@@ -1293,8 +1319,12 @@ async function runSingleAttempt(
 		if (options.signal) {
 			const kill = () => {
 				if (processClosed || lifecycleFinished) return;
+				result.terminalCause = "explicit-stop";
 				proc.kill("SIGTERM");
-				setTimeout(() => !proc.killed && proc.kill("SIGKILL"), 3000);
+				abortHardKillTimer = setTimeout(() => {
+					if (!processClosed && !childExited) trySignalChild(proc, "SIGKILL");
+				}, 3000);
+				abortHardKillTimer.unref?.();
 			};
 			if (options.signal.aborted) kill();
 			else {
@@ -1308,6 +1338,7 @@ async function runSingleAttempt(
 				if (processClosed || lifecycleFinished) return;
 				if (result.timedOut) return;
 				interruptedByControl = true;
+				result.terminalCause = "interrupt";
 				clearTimeoutTimers();
 				clearAllToolTimeouts();
 				progress.status = "running";
@@ -1340,6 +1371,7 @@ async function runSingleAttempt(
 		}
 	});
 	result.exitCode = exitCode;
+	if (!result.terminalCause && result.exitCode === 0 && !result.error) result.terminalCause = "completed";
 	if (interruptedByControl) {
 		result.exitCode = 0;
 		result.interrupted = true;
@@ -1632,6 +1664,13 @@ async function runSyncCompletionInner(
 	const acceptancePrompt = formatAcceptancePrompt(effectiveAcceptance, { reportOptional: isAgentContractV1(options.agentContract) });
 	const taskWithAcceptance = acceptancePrompt ? `${task}\n${acceptancePrompt}` : task;
 	options.onEffectivePrompt?.(taskWithAcceptance);
+	const reviewCheckpointStorePath = options.checkpointPolicy
+		? options.reviewCheckpointStorePath ?? checkpointStorePath(
+			options.artifactsDir ?? path.join(TEMP_ROOT_DIR, "foreground"),
+			options.runId,
+			options.index ?? 0,
+		)
+		: undefined;
 	const sessionEnabled = Boolean(options.sessionFile || options.sessionDir) || shareEnabled;
 	if (options.context === "fork" && options.sessionFile && existsSync(options.sessionFile)) {
 		alignForkedSessionCwd(options.sessionFile, options.cwd ?? runtimeCwd);
@@ -1730,6 +1769,7 @@ async function runSyncCompletionInner(
 	let detachedReason: string | undefined;
 	const attemptOptions: RunSyncOptions = {
 		...options,
+		...(reviewCheckpointStorePath ? { reviewCheckpointStorePath } : {}),
 		onDetachReceipt: (receipt) => {
 			receipt.acceptance = buildPendingAcceptanceLedger(effectiveAcceptance);
 			try {
@@ -1886,6 +1926,19 @@ async function runSyncCompletionInner(
 	};
 	if (transcriptWriter) result.transcriptPath = artifactPathsResult?.transcriptPath;
 	if (transcriptWriter?.getError()) result.transcriptError = transcriptWriter.getError();
+	if (options.checkpointPolicy) {
+		const checkpoints = salvageReviewCheckpoints({
+			storePath: reviewCheckpointStorePath,
+			transcriptPath: result.transcriptPath,
+			identity: { runId: options.runId, childIndex: options.index ?? 0, agent: agentName },
+		});
+		if (checkpoints.length > 0) {
+			result.reviewCheckpoints = checkpoints;
+			const evidence = projectCheckpointEvidence(checkpoints)!;
+			result.reviewFindings = evidence.reviewFindings;
+			result.residualRisks = evidence.residualRisks;
+		}
+	}
 
 	try {
 		if (artifactPathsResult && options.artifactConfig?.enabled !== false) {
@@ -1944,6 +1997,8 @@ async function runSyncCompletionInner(
 					: undefined,
 				cwd: options.cwd ?? runtimeCwd,
 				reportOptional: isAgentContractV1(options.agentContract),
+				...(options.checkpointPolicy && result.reviewCheckpoints?.length ? { checkpointEvidence: projectCheckpointEvidence(result.reviewCheckpoints)! } : {}),
+				requireCheckpoint: Boolean(options.checkpointPolicy),
 				artifactsDir: options.artifactsDir,
 				runId: options.runId,
 			});

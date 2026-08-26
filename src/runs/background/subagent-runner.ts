@@ -37,7 +37,10 @@ import {
 	type ResolvedControlConfig,
 	type ResolvedTurnBudget,
 	type ResolvedToolBudget,
+	type ReviewCheckpointPolicy,
+	type ReviewCheckpointRecord,
 	type RunFanoutBudgetDescriptor,
+	type TerminalCause,
 	type SubagentRunMode,
 	type SubagentOutputState,
 	type UsageBudgetConfig,
@@ -131,6 +134,7 @@ import { attachContractProjections, isAgentContractV1 } from "../shared/agent-co
 import { waitForImportedAsyncRoot } from "./chain-root-attachment.ts";
 import { appendRunnerStepsToStatus, consumeChainAppendRequests, countPendingChainAppendRequests, statusStepDescription } from "./chain-append.ts";
 import { appendTurnBudgetSystemPrompt, formatTurnBudgetOutput, initialTurnBudgetState, turnBudgetDecision, turnBudgetDeferredNote, turnBudgetDeferredState, turnBudgetExceededMessage, turnBudgetSoftNote, turnBudgetState } from "../shared/turn-budget.ts";
+import { checkpointStorePath, projectCheckpointEvidence, salvageReviewCheckpoints } from "../shared/review-checkpoint.ts";
 import { initialToolBudgetState, toolBudgetState } from "../shared/tool-budget.ts";
 import { effectiveToolTimeoutMs, formatToolTimeoutMessage, toolTimeoutCallKey } from "../shared/tool-timeout.ts";
 import { usageBudgetExceededMessage, usageBudgetState } from "../shared/usage-budget.ts";
@@ -186,6 +190,7 @@ interface SubagentRunConfig {
 	nestedSelf?: { parentRunId: string; parentStepIndex?: number; depth: number; path?: Array<{ runId: string; stepIndex?: number; agent?: string }> };
 	timeoutMs?: number;
 	deadlineAt?: number;
+	checkpointPolicy?: ReviewCheckpointPolicy;
 	/** Resolved configured hard per-tool-call timeout (ms); fast tools still have a default when undefined. */
 	toolTimeoutMs?: number;
 	turnBudget?: ResolvedTurnBudget;
@@ -225,7 +230,12 @@ interface StepResult {
 	detached?: boolean;
 	timedOut?: boolean;
 	stopped?: boolean;
+	terminalCause?: TerminalCause;
 	processSignal?: string | null;
+	checkpointPolicy?: ReviewCheckpointPolicy;
+	reviewCheckpoints?: ReviewCheckpointRecord[];
+	reviewFindings?: string[];
+	residualRisks?: string[];
 	turnBudget?: TurnBudgetState;
 	turnBudgetExceeded?: boolean;
 	wrapUpRequested?: boolean;
@@ -503,6 +513,7 @@ interface ChildEvent {
 	message?: ChildMessage;
 	toolName?: string;
 	args?: Record<string, unknown>;
+	details?: unknown;
 	willRetry?: unknown;
 }
 
@@ -521,6 +532,7 @@ interface RunPiStreamingResult {
 	interrupted?: boolean;
 	timedOut?: boolean;
 	stopped?: boolean;
+	terminalCause?: TerminalCause;
 	turnBudget?: TurnBudgetState;
 	turnBudgetExceeded?: boolean;
 	wrapUpRequested?: boolean;
@@ -597,6 +609,7 @@ function runPiStreaming(
 		let interrupted = false;
 		let timedOut = false;
 		let stopped = false;
+		let terminalCause: TerminalCause | undefined;
 		let turnBudgetExceeded = false;
 		let turnBudgetMessage: string | undefined;
 		let turnBudget: TurnBudgetState | undefined;
@@ -769,6 +782,7 @@ function runPiStreaming(
 		const failProtocol = (limit: ProtocolOutputLimit): void => {
 			if (protocolError) return;
 			protocolError = limit;
+			terminalCause = "protocol-failure";
 			error = formatProtocolOutputLimit(limit);
 			if (!childExited) {
 				trySignalChild(child, "SIGTERM");
@@ -800,15 +814,17 @@ function runPiStreaming(
 		registerInterrupt?.(() => {
 			if (settled || timedOut || stopped) return;
 			interrupted = true;
+			terminalCause = "interrupt";
 			if (!error) error = "Interrupted. Waiting for explicit next action.";
 			trySignalChild(child, "SIGINT");
 			setTimeout(() => {
 				if (!settled && !timedOut && !stopped) trySignalChild(child, "SIGTERM");
 			}, 1000).unref?.();
 		});
-		const terminateForTimeout = (message: string): void => {
+		const terminateForTimeout = (message: string, cause: TerminalCause = "workflow-deadline"): void => {
 			if (settled || timedOut || stopped) return;
 			timedOut = true;
+			terminalCause = cause;
 			// runPiStreaming's terminal result derives the timeout error from this
 			// message, so retain the tool-specific reason through finalization.
 			timeoutMessage = message;
@@ -851,7 +867,7 @@ function runPiStreaming(
 			const toolName = event.toolName;
 			const timer = setTimeout(() => {
 				removeToolTimeoutKey(key);
-				terminateForTimeout(formatToolTimeoutMessage(toolName, timeoutForTool));
+				terminateForTimeout(formatToolTimeoutMessage(toolName, timeoutForTool), "tool-timeout");
 			}, timeoutForTool);
 			timer.unref?.();
 			activeToolTimeouts.set(key, { toolName, timer });
@@ -863,6 +879,7 @@ function runPiStreaming(
 		registerStop?.(() => {
 			if (settled || timedOut || stopped) return;
 			stopped = true;
+			terminalCause = "explicit-stop";
 			interrupted = false;
 			error = stopMessage ?? "Subagent stopped by user.";
 			if (processTreeController) void processTreeController.terminate();
@@ -871,6 +888,7 @@ function runPiStreaming(
 		registerTurnBudgetAbort?.((message, state) => {
 			if (settled || timedOut || stopped || turnBudgetExceeded) return;
 			turnBudgetExceeded = true;
+			terminalCause = "turn-budget";
 			turnBudgetMessage = message;
 			turnBudget = state;
 			interrupted = false;
@@ -989,6 +1007,7 @@ function runPiStreaming(
 				turnBudgetExceeded,
 				forcedDrainAfterFinalSuccess,
 			}) ? formatProcessSignalError(signal!) : undefined;
+			if (!terminalCause) terminalCause = signal ? "process-signal" : (exitCode === 0 && !finalError ? "completed" : "process-failure");
 			resolve(omitUndefinedProperties({
 				stderr,
 				exitCode: timedOut || stopped ? 1 : turnBudgetExceeded ? 1 : interrupted || forcedDrainAfterFinalSuccess ? 0 : forcedTerminationSignal || signal ? (exitCode ?? 1) : exitCode,
@@ -1004,6 +1023,7 @@ function runPiStreaming(
 				interrupted,
 				timedOut,
 				stopped,
+				terminalCause,
 				turnBudget,
 				turnBudgetExceeded,
 				wrapUpRequested: turnBudget?.outcome === "wrap-up-requested" || turnBudget?.outcome === "termination-deferred" || turnBudgetExceeded || undefined,
@@ -1037,7 +1057,8 @@ function runPiStreaming(
 			const stderr = stderrTail.text();
 			const finalOutput = getFinalOutput(messages) || rawStdoutTail.text().trim();
 			const spawnErrorMessage = spawnError instanceof Error ? spawnError.message : String(spawnError);
-			resolve(omitUndefinedProperties({ stderr, exitCode: 1, messages, usage, toolCount, durationMs: Date.now() - startedAt, model, error: stopped ? (stopMessage ?? "Subagent stopped by user.") : timedOut ? (timeoutMessage ?? "Subagent timed out.") : turnBudgetExceeded ? turnBudgetMessage : error ?? assistantError ?? spawnErrorMessage, protocolError, finalOutput: (timedOut || stopped) && !finalOutput.trim() ? (stopped ? stopMessage ?? "Subagent stopped by user." : timeoutMessage ?? "Subagent timed out.") : finalOutput, outputState: finalOutput.trim() ? "present" : "absent", timedOut, stopped, turnBudget, turnBudgetExceeded, wrapUpRequested: turnBudget?.outcome === "wrap-up-requested" || turnBudget?.outcome === "termination-deferred" || turnBudgetExceeded || undefined, observedMutationAttempt, structuredOutputToolInvoked, structuredOutputMessageStartIndex, watchdog: childWatchdogState, processInstanceId, processTree: { state: "unknown", reason: "verification-failed", diagnostic: spawnErrorMessage } }));
+			terminalCause = terminalCause ?? "spawn-failure";
+			resolve(omitUndefinedProperties({ stderr, exitCode: 1, messages, usage, toolCount, durationMs: Date.now() - startedAt, model, error: stopped ? (stopMessage ?? "Subagent stopped by user.") : timedOut ? (timeoutMessage ?? "Subagent timed out.") : turnBudgetExceeded ? turnBudgetMessage : error ?? assistantError ?? spawnErrorMessage, protocolError, finalOutput: (timedOut || stopped) && !finalOutput.trim() ? (stopped ? stopMessage ?? "Subagent stopped by user." : timeoutMessage ?? "Subagent timed out.") : finalOutput, outputState: finalOutput.trim() ? "present" : "absent", timedOut, stopped, terminalCause, turnBudget, turnBudgetExceeded, wrapUpRequested: turnBudget?.outcome === "wrap-up-requested" || turnBudget?.outcome === "termination-deferred" || turnBudgetExceeded || undefined, observedMutationAttempt, structuredOutputToolInvoked, structuredOutputMessageStartIndex, watchdog: childWatchdogState, processInstanceId, processTree: { state: "unknown", reason: "verification-failed", diagnostic: spawnErrorMessage } }));
 		});
 	});
 }
@@ -1451,6 +1472,9 @@ async function runSingleStepInner(
 	let turnBudget = ctx.turnBudget ? initialTurnBudgetState(ctx.turnBudget) : undefined;
 	let toolBudget = step.toolBudget ? initialToolBudgetState(step.toolBudget) : undefined;
 	let toolBudgetBlocked = false;
+	const reviewCheckpointStorePath = step.checkpointPolicy
+		? checkpointStorePath(path.dirname(ctx.outputFile), ctx.id, ctx.flatIndex)
+		: undefined;
 	let actualLaunchContractDigest = step.launchContractDigest;
 
 	let modelIndex = 0;
@@ -1517,6 +1541,8 @@ async function runSingleStepInner(
 			steerCapabilityPath: ctx.steerCapabilityPath,
 			steerAckDir: ctx.steerAckDir,
 			structuredOutput: effectiveStructuredOutput,
+			checkpointPolicy: step.checkpointPolicy,
+			reviewCheckpointStorePath,
 			toolBudget: step.toolBudget,
 			permissionRules: step.permissionRules,
 			permissionAuditPath: step.permissionRules && ctx.artifactsDir
@@ -1534,6 +1560,7 @@ async function runSingleStepInner(
 				cwd: step.cwd ?? ctx.cwd,
 				requireReadTool: Boolean(step.skills?.length),
 				structuredOutput: Boolean(effectiveStructuredOutput),
+				checkpointPolicy: step.checkpointPolicy,
 				capabilityCeiling: step.capabilityCeiling ?? ctx.capabilityCeiling,
 				inheritedCapabilityCeiling: decodeSubagentCapabilityCeiling(process.env[SUBAGENT_CAPABILITY_CEILING_ENV]),
 			}));
@@ -1554,6 +1581,7 @@ async function runSingleStepInner(
 				mcpDirectTools: toolPlan.effectiveMcpTools,
 				...(step.outputPath ? { outputPath: step.outputPath } : {}),
 				...(step.outputMode ? { outputMode: step.outputMode } : {}),
+				...(step.checkpointPolicy ? { checkpointPolicy: step.checkpointPolicy } : {}),
 				...(step.structuredOutputSchema ? { structuredOutputSchema: step.structuredOutputSchema } : {}),
 			}));
 		}
@@ -1808,6 +1836,14 @@ async function runSingleStepInner(
 		: resolvedOutput.savedPath
 			? "unknown"
 			: finalResult?.outputState ?? "unknown";
+	const checkpoints = step.checkpointPolicy
+		? salvageReviewCheckpoints({
+			storePath: reviewCheckpointStorePath,
+			transcriptPath: transcriptWriter ? artifactPaths?.transcriptPath : undefined,
+			identity: { runId: ctx.id, childIndex: ctx.flatIndex, agent: step.agent },
+		})
+		: [];
+	const checkpointEvidence = projectCheckpointEvidence(checkpoints);
 	const finalizedOutput = finalizeSingleOutput(omitUndefinedProperties({
 		fullOutput: outputForSummary,
 		outputPath: step.outputPath,
@@ -1829,6 +1865,8 @@ async function runSingleStepInner(
 			signal: combinedAbortSignal([ctx.timeoutSignal, ctx.stopSignal]),
 			abortMessage: ctx.stopSignal?.aborted ? ctx.stopMessage ?? "Subagent stopped by user." : ctx.timeoutMessage ?? "Subagent timed out.",
 			reportOptional: isAgentContractV1(step.agentContract),
+			...(checkpointEvidence ? { checkpointEvidence } : {}),
+			requireCheckpoint: Boolean(step.checkpointPolicy),
 			artifactsDir: ctx.artifactsDir,
 			runId: ctx.id,
 		}))
@@ -1879,12 +1917,14 @@ async function runSingleStepInner(
 				modelAttempts,
 				error: effectiveFinalError,
 				acceptance: effectiveAcceptance,
+				checkpointPolicy: step.checkpointPolicy,
 				...(capabilityAudit ? { capabilityCeiling: capabilityAudit.ceiling, capabilityAudit } : {}),
 				launchContractDigest: actualLaunchContractDigest,
 				launchResolvedExtensions,
 				...((finalResult as (RunPiStreamingResult & { runtimeAcknowledgedExtensions?: RuntimeAcknowledgedChildExtensionsV1 }) | undefined)?.runtimeAcknowledgedExtensions ? { runtimeAcknowledgedExtensions: (finalResult as RunPiStreamingResult & { runtimeAcknowledgedExtensions?: RuntimeAcknowledgedChildExtensionsV1 }).runtimeAcknowledgedExtensions } : {}),
 				...(transcriptWriter ? { transcriptPath: artifactPaths.transcriptPath } : {}),
 				transcriptError: transcriptWriter?.getError(),
+				...(checkpoints.length ? { reviewCheckpoints: checkpoints, reviewFindings: checkpointEvidence?.reviewFindings, residualRisks: checkpointEvidence?.residualRisks } : {}),
 				skills: step.skills,
 				timestamp: Date.now(),
 			},
@@ -1915,6 +1955,9 @@ async function runSingleStepInner(
 		interrupted: timedOutAfterAcceptance || stoppedAfterAcceptance || turnBudgetExceeded ? false : finalResult?.interrupted,
 		timedOut: timedOutAfterAcceptance ? true : finalResult?.timedOut,
 		stopped: stoppedAfterAcceptance ? true : finalResult?.stopped,
+		terminalCause: stoppedAfterAcceptance ? "explicit-stop" : timedOutAfterAcceptance ? "workflow-deadline" : turnBudgetExceeded ? "turn-budget" : finalResult?.terminalCause,
+		...(checkpoints.length ? { reviewCheckpoints: checkpoints, reviewFindings: checkpointEvidence?.reviewFindings, residualRisks: checkpointEvidence?.residualRisks } : {}),
+		checkpointPolicy: step.checkpointPolicy,
 		processSignal: finalResult?.processSignal,
 		turnBudget,
 		turnBudgetExceeded: turnBudgetExceeded || undefined,
@@ -2350,6 +2393,7 @@ async function runSubagent(
 		lastUpdate: overallStartTime,
 		...(config.timeoutMs !== undefined ? { timeoutMs: config.timeoutMs } : {}),
 		...(config.deadlineAt !== undefined ? { deadlineAt: config.deadlineAt } : {}),
+		...(config.checkpointPolicy ? { checkpointPolicy: config.checkpointPolicy } : {}),
 		...(config.turnBudget ? { turnBudget: initialTurnBudgetState(config.turnBudget) } : {}),
 		...(config.toolBudget ? { toolBudget: initialToolBudgetState(config.toolBudget) } : {}),
 		...(config.usageBudget ? { usageBudget: usageBudgetState(config.usageBudget, undefined) } : {}),
@@ -3852,6 +3896,11 @@ async function runSubagent(
 				requiredStatusStep(statusPayload, fi).exitCode = stopped || childStopped ? 1 : timedOut ? 1 : childInterrupted ? 0 : singleResult.exitCode;
 				setOptionalProperty(requiredStatusStep(statusPayload, fi), "timedOut", timedOut || singleResult.timedOut ? true : undefined);
 				setOptionalProperty(requiredStatusStep(statusPayload, fi), "stopped", stopped || childStopped ? true : undefined);
+				setOptionalProperty(requiredStatusStep(statusPayload, fi), "terminalCause", stopped || childStopped ? "explicit-stop" : timedOut ? "workflow-deadline" : singleResult.terminalCause);
+				setOptionalProperty(requiredStatusStep(statusPayload, fi), "checkpointPolicy", singleResult.checkpointPolicy);
+				setOptionalProperty(requiredStatusStep(statusPayload, fi), "reviewCheckpoints", singleResult.reviewCheckpoints);
+				setOptionalProperty(requiredStatusStep(statusPayload, fi), "reviewFindings", singleResult.reviewFindings);
+				setOptionalProperty(requiredStatusStep(statusPayload, fi), "residualRisks", singleResult.residualRisks);
 				setOptionalProperty(requiredStatusStep(statusPayload, fi), "turnBudget", singleResult.turnBudget);
 				setOptionalProperty(requiredStatusStep(statusPayload, fi), "turnBudgetExceeded", singleResult.turnBudgetExceeded);
 				setOptionalProperty(requiredStatusStep(statusPayload, fi), "wrapUpRequested", singleResult.wrapUpRequested);
@@ -3925,6 +3974,11 @@ async function runSubagent(
 					interrupted: pr.interrupted,
 					timedOut: pr.timedOut,
 					stopped: pr.stopped,
+					terminalCause: pr.terminalCause,
+					checkpointPolicy: pr.checkpointPolicy,
+					reviewCheckpoints: pr.reviewCheckpoints,
+					reviewFindings: pr.reviewFindings,
+					residualRisks: pr.residualRisks,
 					turnBudget: pr.turnBudget,
 					turnBudgetExceeded: pr.turnBudgetExceeded,
 					wrapUpRequested: pr.wrapUpRequested,
@@ -4246,6 +4300,11 @@ async function runSubagent(
 						requiredStatusStep(statusPayload, fi).exitCode = stopped || childStopped ? 1 : timedOut ? 1 : childInterrupted ? 0 : singleResult.exitCode;
 						setOptionalProperty(requiredStatusStep(statusPayload, fi), "timedOut", timedOut || singleResult.timedOut ? true : undefined);
 						setOptionalProperty(requiredStatusStep(statusPayload, fi), "stopped", stopped || childStopped ? true : undefined);
+						setOptionalProperty(requiredStatusStep(statusPayload, fi), "terminalCause", stopped || childStopped ? "explicit-stop" : timedOut ? "workflow-deadline" : singleResult.terminalCause);
+						setOptionalProperty(requiredStatusStep(statusPayload, fi), "checkpointPolicy", singleResult.checkpointPolicy);
+						setOptionalProperty(requiredStatusStep(statusPayload, fi), "reviewCheckpoints", singleResult.reviewCheckpoints);
+						setOptionalProperty(requiredStatusStep(statusPayload, fi), "reviewFindings", singleResult.reviewFindings);
+						setOptionalProperty(requiredStatusStep(statusPayload, fi), "residualRisks", singleResult.residualRisks);
 						setOptionalProperty(requiredStatusStep(statusPayload, fi), "turnBudget", singleResult.turnBudget);
 						setOptionalProperty(requiredStatusStep(statusPayload, fi), "turnBudgetExceeded", singleResult.turnBudgetExceeded);
 						setOptionalProperty(requiredStatusStep(statusPayload, fi), "wrapUpRequested", singleResult.wrapUpRequested);
@@ -4353,6 +4412,11 @@ async function runSubagent(
 						interrupted: pr.interrupted,
 						timedOut: pr.timedOut,
 						stopped: pr.stopped,
+						terminalCause: pr.terminalCause,
+						checkpointPolicy: pr.checkpointPolicy,
+						reviewCheckpoints: pr.reviewCheckpoints,
+						reviewFindings: pr.reviewFindings,
+						residualRisks: pr.residualRisks,
 						turnBudget: pr.turnBudget,
 						turnBudgetExceeded: pr.turnBudgetExceeded,
 						wrapUpRequested: pr.wrapUpRequested,
@@ -4597,6 +4661,11 @@ async function runSubagent(
 				interrupted: singleResult.interrupted,
 				timedOut: timedOut || singleResult.timedOut ? true : undefined,
 				stopped: stopped || childStopped ? true : undefined,
+				terminalCause: stopped || childStopped ? "explicit-stop" : timedOut ? "workflow-deadline" : singleResult.terminalCause,
+				checkpointPolicy: singleResult.checkpointPolicy,
+				reviewCheckpoints: singleResult.reviewCheckpoints,
+				reviewFindings: singleResult.reviewFindings,
+				residualRisks: singleResult.residualRisks,
 				turnBudget: singleResult.turnBudget,
 				turnBudgetExceeded: singleResult.turnBudgetExceeded,
 				wrapUpRequested: singleResult.wrapUpRequested,
@@ -4644,6 +4713,11 @@ async function runSubagent(
 			requiredStatusStep(statusPayload, flatIndex).exitCode = stopped || childStopped ? 1 : timedOut ? 1 : childInterrupted ? 0 : singleResult.exitCode;
 			setOptionalProperty(requiredStatusStep(statusPayload, flatIndex), "timedOut", timedOut || singleResult.timedOut ? true : undefined);
 			setOptionalProperty(requiredStatusStep(statusPayload, flatIndex), "stopped", stopped || childStopped ? true : undefined);
+			setOptionalProperty(requiredStatusStep(statusPayload, flatIndex), "terminalCause", stopped || childStopped ? "explicit-stop" : timedOut ? "workflow-deadline" : singleResult.terminalCause);
+			setOptionalProperty(requiredStatusStep(statusPayload, flatIndex), "checkpointPolicy", singleResult.checkpointPolicy);
+			setOptionalProperty(requiredStatusStep(statusPayload, flatIndex), "reviewCheckpoints", singleResult.reviewCheckpoints);
+			setOptionalProperty(requiredStatusStep(statusPayload, flatIndex), "reviewFindings", singleResult.reviewFindings);
+			setOptionalProperty(requiredStatusStep(statusPayload, flatIndex), "residualRisks", singleResult.residualRisks);
 			setOptionalProperty(requiredStatusStep(statusPayload, flatIndex), "turnBudget", singleResult.turnBudget);
 			setOptionalProperty(requiredStatusStep(statusPayload, flatIndex), "turnBudgetExceeded", singleResult.turnBudgetExceeded);
 			setOptionalProperty(requiredStatusStep(statusPayload, flatIndex), "wrapUpRequested", singleResult.wrapUpRequested);
@@ -4839,6 +4913,8 @@ async function runSubagent(
 		turnBudgetExceeded: result.turnBudgetExceeded,
 	})));
 	statusPayload.state = stopped || signalTerminated ? "stopped" : timedOut || turnBudgetExceeded || usageBudgetExceeded || statusPayload.error ? "failed" : interrupted ? "paused" : results.every((r) => r.success) ? "complete" : "failed";
+	statusPayload.terminalCause = stopped ? "explicit-stop" : timedOut ? "workflow-deadline" : turnBudgetExceeded ? "turn-budget" : interrupted ? "interrupt" : signalTerminated ? "process-signal" : results.find((result) => result.terminalCause)?.terminalCause ?? (results.every((result) => result.success) ? "completed" : "process-failure");
+	if (config.checkpointPolicy) statusPayload.checkpointPolicy = config.checkpointPolicy;
 	closeSteerInbox(asyncDir, statusPayload.state, (filePath, payload) => runPersistence.write(filePath, payload));
 	disposeControlInbox();
 	for (const request of consumeSteerRequests(asyncDir)) deliverSteerRequest(request);
@@ -4901,6 +4977,8 @@ async function runSubagent(
 			summary: stopped ? stopMessage : signalTerminated ? (statusPayload.error ?? "Subagent process terminated by signal.") : timedOut ? (timeoutMessage ?? "Subagent timed out.") : turnBudgetExceeded ? (statusPayload.error ?? "Subagent exceeded turn budget.") : usageBudgetExceeded ? (statusPayload.error ?? "Usage budget exhausted.") : interrupted ? "Paused after interrupt. Waiting for explicit next action." : summary,
 			...(config.timeoutMs !== undefined ? { timeoutMs: config.timeoutMs } : {}),
 			...(config.deadlineAt !== undefined ? { deadlineAt: config.deadlineAt } : {}),
+			...(statusPayload.terminalCause ? { terminalCause: statusPayload.terminalCause } : {}),
+			...(config.checkpointPolicy ? { checkpointPolicy: config.checkpointPolicy } : {}),
 			...(statusPayload.turnBudget ? { turnBudget: statusPayload.turnBudget } : {}),
 			...(statusPayload.turnBudgetExceeded ? { turnBudgetExceeded: true } : {}),
 			...(statusPayload.wrapUpRequested ? { wrapUpRequested: true } : {}),
@@ -4920,6 +4998,11 @@ async function runSubagent(
 				interrupted: r.interrupted || undefined,
 				timedOut: r.timedOut || undefined,
 				stopped: r.stopped || undefined,
+				terminalCause: r.terminalCause,
+				checkpointPolicy: r.checkpointPolicy,
+				reviewCheckpoints: r.reviewCheckpoints,
+				reviewFindings: r.reviewFindings,
+				residualRisks: r.residualRisks,
 				processSignal: r.processSignal || undefined,
 				turnBudget: r.turnBudget,
 				turnBudgetExceeded: r.turnBudgetExceeded || undefined,
@@ -4974,6 +5057,7 @@ async function runSubagent(
 			cwd,
 			asyncDir,
 			launchContractDigest: config.launchContractDigest,
+			...(config.checkpointPolicy ? { checkpointPolicy: config.checkpointPolicy } : {}),
 			launchResolvedExtensions: config.launchResolvedExtensions,
 			runtimeAcknowledgedExtensions: singleRuntimeAcknowledgedExtensions,
 			sessionId: config.sessionId,

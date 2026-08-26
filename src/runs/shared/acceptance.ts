@@ -1013,6 +1013,7 @@ export function aggregateAcceptanceReport(input: {
 	const childReports = input.results.map((result) => result.acceptance?.childReport).filter((report): report is AcceptanceReport => Boolean(report));
 	const blockers = input.results.filter((result) => result.exitCode !== 0 || result.acceptance?.status === "rejected");
 	const successfulChildren = input.results.length > 0 && blockers.length === 0;
+	const checkpointReviewEvidence = childReports.filter((report) => report.reviewFindings !== undefined);
 	return {
 		criteriaSatisfied: [
 			{ id: "criterion-1", status: successfulChildren ? "satisfied" : "not-satisfied", evidence: successfulChildren ? `All ${input.results.length} dynamic child run(s) completed without child or acceptance blockers.` : "Dynamic fanout produced no accepted child evidence." },
@@ -1032,7 +1033,7 @@ export function aggregateAcceptanceReport(input: {
 			...blockers.map((result) => `${result.agent}: ${result.error ?? "child or acceptance gate failed"}`),
 		]),
 		noStagedFiles: childReports.length > 0 && childReports.every((report) => report.noStagedFiles === true),
-		reviewFindings: uniqueStrings(childReports.flatMap((report) => report.reviewFindings ?? [])),
+		...(checkpointReviewEvidence.length > 0 ? { reviewFindings: uniqueStrings(checkpointReviewEvidence.flatMap((report) => report.reviewFindings!)) } : {}),
 		manualNotes: input.notes ?? `Aggregated acceptance evidence from ${input.results.length} dynamic fanout child run(s).`,
 		notes: input.notes,
 	};
@@ -1232,6 +1233,9 @@ export async function evaluateAcceptance(input: {
 	signal?: AbortSignal;
 	abortMessage?: string;
 	reportOptional?: boolean;
+	/** Runtime-validated checkpoint evidence. It is the only review-findings source when required. */
+	checkpointEvidence?: { reviewFindings: string[]; residualRisks: string[] };
+	requireCheckpoint?: boolean;
 	artifactsDir?: string;
 	runId?: string;
 }): Promise<AcceptanceLedger> {
@@ -1248,6 +1252,12 @@ export async function evaluateAcceptance(input: {
 		verifyRuns: [],
 	};
 	if (acceptance.level === "none") return ledger;
+	if (input.requireCheckpoint && !input.checkpointEvidence) {
+		ledger.runtimeChecks.push({ id: "review-checkpoint", status: "failed", message: "A validated review checkpoint is required but none was recovered." });
+		ledger.status = "rejected";
+		ledger.evidenceStatus = "rejected";
+		return ledger;
+	}
 
 	const parsed = input.report
 		? (() => {
@@ -1259,6 +1269,10 @@ export async function evaluateAcceptance(input: {
 		: parseAcceptanceReportSources(input.output, input.fileOutput);
 	const needsReport = acceptanceRequiresChildReport(acceptance);
 	if (parsed.report) {
+		if (input.requireCheckpoint && input.checkpointEvidence) {
+			parsed.report.reviewFindings = [...input.checkpointEvidence.reviewFindings];
+			parsed.report.residualRisks = [...input.checkpointEvidence.residualRisks];
+		}
 		ledger.childReport = parsed.report;
 		ledger.status = "attested";
 		ledger.evidenceStatus = "attested";

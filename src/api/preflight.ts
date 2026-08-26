@@ -11,9 +11,10 @@ import { applyThinkingSuffix, resolvePiLaunchToolPlan, type PiLaunchToolPlan } f
 import { injectOutputPathSystemPrompt, normalizeSingleOutputOverride, resolveSingleOutputPath } from "../runs/shared/single-output.ts";
 import { getArtifactPaths, getArtifactsDir } from "../shared/artifacts.ts";
 import { resolveEffectiveThinking } from "../shared/model-info.ts";
-import { SUBAGENT_LIFECYCLE_ARTIFACT_VERSION, type ArtifactDirPreference, type ArtifactPaths, type JsonSchemaObject, type OutputMode } from "../shared/types.ts";
+import { SUBAGENT_LIFECYCLE_ARTIFACT_VERSION, type ArtifactDirPreference, type ArtifactPaths, type JsonSchemaObject, type OutputMode, type ReviewCheckpointPolicy } from "../shared/types.ts";
 import { capabilityCeilingAgentRestrictionMessage, intersectSubagentCapabilityCeilings, type ResolvedSubagentCapabilityCeiling, type SubagentCapabilityAudit } from "../runs/shared/capability-ceiling.ts";
 import { appendTurnBudgetSystemPrompt } from "../runs/shared/turn-budget.ts";
+import { validateCheckpointPolicy } from "../runs/shared/review-checkpoint.ts";
 import type { ResolvedTurnBudget } from "../shared/types.ts";
 import type { ResolvedMcpDirectToolSelection } from "../runs/shared/mcp-direct-tool-allowlist.ts";
 import { resolveStepBehavior } from "../shared/settings.ts";
@@ -59,6 +60,7 @@ export interface SubagentLaunchContractInput {
 	outputMode?: OutputMode;
 	outputSchema?: JsonSchemaObject;
 	turnBudget?: ResolvedTurnBudget;
+	checkpointPolicy?: ReviewCheckpointPolicy;
 	artifacts?: boolean;
 	artifactDir?: ArtifactDirPreference;
 	parentSessionFile?: string | null;
@@ -148,6 +150,7 @@ export interface SubagentLaunchContract {
 	systemPromptMode: AgentConfig["systemPromptMode"];
 	inheritProjectContext: boolean;
 	inheritSkills: boolean;
+	checkpointPolicy?: ReviewCheckpointPolicy;
 	skills: SubagentLaunchContractSkills;
 	tools: SubagentLaunchContractTools;
 	roots: SubagentLaunchContractRoots;
@@ -238,6 +241,8 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 	if (input.artifactDir !== undefined && input.artifactDir !== "project" && input.artifactDir !== "session" && input.artifactDir !== "temp") {
 		return { ok: false, code: "invalid_artifact_dir", message: `Unsupported artifactDir '${String(input.artifactDir)}'; expected 'project', 'session', or 'temp'.`, diagnostics };
 	}
+	const checkpointPolicy = input.checkpointPolicy === undefined ? undefined : validateCheckpointPolicy(input.checkpointPolicy);
+	if (checkpointPolicy?.error) return { ok: false, code: "unsupported_mode", message: checkpointPolicy.error, diagnostics };
 	const scope = resolveExecutionAgentScope(input.agentScope);
 	const discovered = discoverAgents(effectiveCwd, scope);
 	const resolvedAgent = resolveAgentName(input.agent, discovered.agents);
@@ -307,6 +312,7 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 			cwd: effectiveCwd,
 			requireReadTool: resolvedSkills.resolved.length > 0,
 			structuredOutput: Boolean(input.outputSchema),
+			checkpointPolicy: checkpointPolicy?.policy,
 			capabilityCeiling: effectiveCapabilityCeiling,
 			agentName: agent.name,
 		});
@@ -367,6 +373,7 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 		systemPromptMode: agent.systemPromptMode,
 		inheritProjectContext: agent.inheritProjectContext,
 		inheritSkills: agent.inheritSkills,
+		...(checkpointPolicy?.policy ? { checkpointPolicy: checkpointPolicy.policy } : {}),
 		skills: {
 			requested: requestedSkills,
 			resolved: resolvedSkills.resolved.map((skill) => ({ name: skill.name, path: skill.path, source: skill.source })),
@@ -427,6 +434,7 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 			mcpDirectTools: toolPlan.effectiveMcpTools,
 			...(outputPath ? { outputPath } : {}),
 			outputMode: input.outputMode ?? "inline",
+			...(checkpointPolicy?.policy ? { checkpointPolicy: checkpointPolicy.policy } : {}),
 			...(input.outputSchema ? { structuredOutputSchema: input.outputSchema } : {}),
 		}),
 	};

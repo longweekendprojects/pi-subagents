@@ -10,6 +10,7 @@ import {
 	TOOL_BUDGET_ZERO_AUTH_ENV,
 } from "../../src/runs/shared/tool-budget.ts";
 import { WAIT_TOOL_ENABLED_ENV } from "../../src/runs/background/wait-config.ts";
+import { REVIEW_CHECKPOINT_POLICY_ENV, REVIEW_CHECKPOINT_STORE_ENV } from "../../src/runs/shared/review-checkpoint.ts";
 import { PI_CODING_AGENT_PACKAGE_ROOT_ENV } from "../../src/shared/utils.ts";
 import {
 	CHILD_TOOL_DIAGNOSTIC_PATH_ENV,
@@ -869,6 +870,26 @@ describe("buildPiArgs system prompt mode wiring", () => {
 
 		assert.equal(args[args.indexOf("--tools") + 1], "read,grep,find,ls");
 		assert.doesNotMatch(args[args.indexOf("--tools") + 1] ?? "", /\b(?:bash|edit|write)\b/);
+	});
+
+	it("keeps review_checkpoint available under explicit tool allowlists and passes its durable store", () => {
+		const { args, env } = buildPiArgs({
+			baseArgs: ["-p"],
+			task: "Review this change.",
+			sessionEnabled: false,
+			inheritProjectContext: false,
+			inheritSkills: false,
+			tools: ["read"],
+			runId: "run-1",
+			childAgentName: "reviewer",
+			childIndex: 0,
+			checkpointPolicy: { version: 1 },
+			reviewCheckpointStorePath: "/tmp/review-checkpoint.json",
+		});
+		assert.equal(args[args.indexOf("--tools") + 1], "read,review_checkpoint");
+		assert.deepEqual(JSON.parse(env[REQUIRED_CHILD_TOOLS_ENV] ?? "[]"), ["read", "review_checkpoint"]);
+		assert.equal(env[REVIEW_CHECKPOINT_POLICY_ENV], JSON.stringify({ version: 1 }));
+		assert.equal(env[REVIEW_CHECKPOINT_STORE_ENV], "/tmp/review-checkpoint.json");
 	});
 
 	it("keeps structured_output available under explicit tool allowlists", () => {

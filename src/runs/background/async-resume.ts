@@ -7,6 +7,7 @@ import { validateToolBudgetConfig } from "../shared/tool-budget.ts";
 import { intersectSubagentCapabilityCeilings, parseSubagentCapabilityCeiling, type ResolvedSubagentCapabilityCeiling } from "../shared/capability-ceiling.ts";
 import { validateRunFanoutBudgetDescriptor } from "../shared/run-fanout-budget.ts";
 import { resolveTurnBudgetConfig } from "../shared/turn-budget.ts";
+import { validateCheckpointPolicy } from "../shared/review-checkpoint.ts";
 import { reconcileAsyncRun } from "./stale-run-reconciler.ts";
 import { resultFilePath, resultPayloadPathForIndexedRun } from "./result-files.ts";
 import { canScanAsyncRunPrefix, MIN_SAFE_ASYNC_RUN_PREFIX_LENGTH } from "./run-id-query.ts";
@@ -310,7 +311,7 @@ export function readAsyncRecoveryDescriptor(asyncDir: string | undefined): Steer
 		"subagentOnlyExtensions", "mcpDirectTools", "systemPrompt", "systemPromptMode", "inheritProjectContext", "inheritSkills", "skills",
 		"skillPath", "agentFilePath", "completionGuard", "memory", "outputPath", "outputMode", "structuredOutputSchema", "acceptance", "sessionDir", "artifactConfig",
 		"artifactsDir", "maxOutput", "controlConfig", "intercomBridge", "absoluteDeadlineAt", "initialTurnBudget", "initialToolBudget", "maxSubagentDepth", "share", "capabilityCeiling",
-		"launchResolvedExtensions", "runFanoutBudget",
+		"launchResolvedExtensions", "runFanoutBudget", "checkpointPolicy",
 	]);
 	for (const field of Object.keys(parsed)) {
 		if (!allowedFields.has(field)) throw new Error(`Invalid async recovery descriptor '${descriptorPath}': unknown field '${field}'.`);
@@ -353,6 +354,11 @@ export function readAsyncRecoveryDescriptor(asyncDir: string | undefined): Steer
 		if ((memory.scope !== "project" && memory.scope !== "user") || typeof memory.path !== "string" || !memory.path.trim()) throw new Error(`Invalid async recovery descriptor '${descriptorPath}': memory is invalid.`);
 	}
 	if (parsed.absoluteDeadlineAt !== undefined && (!Number.isFinite(parsed.absoluteDeadlineAt) || (parsed.absoluteDeadlineAt as number) <= 0)) throw new Error(`Invalid async recovery descriptor '${descriptorPath}': absoluteDeadlineAt must be a positive timestamp.`);
+	if (parsed.checkpointPolicy !== undefined) {
+		const policy = validateCheckpointPolicy(parsed.checkpointPolicy, "recoveryDescriptor.checkpointPolicy");
+		if (!policy.policy) throw new Error(`Invalid async recovery descriptor '${descriptorPath}': ${policy.error}`);
+		parsed.checkpointPolicy = policy.policy;
+	}
 	if (parsed.initialTurnBudget !== undefined) {
 		parsed.initialTurnBudget = normalizeRecoveryTurnBudget(parsed.initialTurnBudget, descriptorPath);
 	}

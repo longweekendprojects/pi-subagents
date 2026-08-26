@@ -3162,7 +3162,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 
 		assert.equal(result.exitCode, 0);
 		assert.equal(result.agentContract?.version, 1);
-		assert.deepEqual(result.execution, { status: "completed", success: true, exitCode: 0 });
+		assert.deepEqual(result.execution, { status: "completed", success: true, exitCode: 0, terminalCause: "completed" });
 		assert.equal(result.acceptance?.status, "not-required");
 		assert.equal(result.review?.status, "not-requested");
 		assert.deepEqual(result.effects, {});

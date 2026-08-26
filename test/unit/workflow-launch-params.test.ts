@@ -21,7 +21,7 @@ describe("workflow launch params", () => {
 		);
 	});
 
-	it("passes an omitted child timeout parent deadline for default resolution", () => {
+	it("clamps an omitted child timeout strictly inside the parent deadline", () => {
 		const parentDeadlineAt = Date.now() + 60_000;
 		const params = prepareWorkflowLaunchParams(
 			{},
@@ -31,19 +31,21 @@ describe("workflow launch params", () => {
 			{ parentDeadlineAt },
 		);
 		assert.equal(params.async, false);
-		assert.equal(params.timeoutMs, undefined);
+		assert.ok((params.timeoutMs ?? 0) > 0);
+		assert.ok((params.timeoutMs ?? Number.MAX_SAFE_INTEGER) < 60_000);
 		assert.equal(params.workflowParentDeadlineAt, parentDeadlineAt);
 	});
 
-	it("preserves explicit child timeout aliases over the parent deadline", () => {
+	it("clamps explicit child timeout aliases to the parent deadline", () => {
 		const parentDeadlineAt = Date.now() + 60_000;
-		assert.equal(prepareWorkflowLaunchParams(
+		const timeoutParams = prepareWorkflowLaunchParams(
 			{},
 			{ agent: "worker", task: "Run", timeoutMs: 90_000 },
 			"workflow-run",
 			"timeout",
 			{ parentDeadlineAt },
-		).timeoutMs, 90_000);
+		);
+		assert.ok((timeoutParams.timeoutMs ?? Number.MAX_SAFE_INTEGER) < 60_000);
 		const maxRuntimeParams = prepareWorkflowLaunchParams(
 			{},
 			{ agent: "worker", task: "Run", maxRuntimeMs: 90_000 },
@@ -51,8 +53,18 @@ describe("workflow launch params", () => {
 			"max-runtime",
 			{ parentDeadlineAt },
 		);
-		assert.equal(maxRuntimeParams.maxRuntimeMs, 90_000);
-		assert.equal(maxRuntimeParams.timeoutMs, undefined);
+		assert.ok((maxRuntimeParams.timeoutMs ?? Number.MAX_SAFE_INTEGER) < 60_000);
+		assert.equal(maxRuntimeParams.maxRuntimeMs, undefined);
+	});
+
+	it("propagates a checkpoint policy from workflow defaults to children", () => {
+		const params = prepareWorkflowLaunchParams(
+			{ checkpointPolicy: { version: 1 } },
+			{ agent: "reviewer", task: "Review" },
+			"workflow-run",
+			"review",
+		);
+		assert.deepEqual(params.checkpointPolicy, { version: 1 });
 	});
 
 	it("preserves explicit async workflow children", () => {
@@ -132,23 +144,19 @@ describe("workflow launch params", () => {
 		);
 	});
 
-	it("does not inherit parent deadlines for retained workflow children", () => {
-		assert.deepEqual(
-			prepareWorkflowLaunchParams(
-				{},
-				{ resume: "retained-run", task: "Continue" },
-				"workflow-run",
-				"continue",
-				{ parentDeadlineAt: Date.now() + 60_000 },
-			),
-			{
-				action: "resume",
-				id: "retained-run",
-				message: "Continue",
-				workflowParentRunId: "workflow-run",
-				workflowKey: "continue",
-			},
+	it("clamps retained workflow resumes to the parent deadline", () => {
+		const parentDeadlineAt = Date.now() + 60_000;
+		const params = prepareWorkflowLaunchParams(
+			{},
+			{ resume: "retained-run", task: "Continue" },
+			"workflow-run",
+			"continue",
+			{ parentDeadlineAt },
 		);
+		assert.equal(params.action, "resume");
+		assert.ok((params.timeoutMs ?? 0) > 0);
+		assert.ok((params.timeoutMs ?? Number.MAX_SAFE_INTEGER) < 60_000);
+		assert.equal(params.workflowParentDeadlineAt, parentDeadlineAt);
 	});
 
 	it("preserves worktree isolation for retained workflow children", () => {

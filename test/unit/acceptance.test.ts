@@ -635,6 +635,37 @@ describe("acceptance gates", () => {
 		}
 	});
 
+	it("distinguishes a missing checkpoint from an explicitly clean checkpoint", async () => {
+		const cwd = tempRepo();
+		try {
+			const acceptance = resolveEffectiveAcceptance({
+				agentName: "reviewer",
+				task: "Review-only. Do not edit.",
+				explicit: { level: "checked", evidence: ["review-findings"] },
+			});
+			const missing = await evaluateAcceptance({
+				acceptance,
+				output: report({ reviewFindings: [] }),
+				cwd,
+				requireCheckpoint: true,
+			});
+			assert.equal(missing.status, "rejected");
+			assert.match(acceptanceFailureMessage(missing) ?? "", /validated review checkpoint is required/);
+
+			const clean = await evaluateAcceptance({
+				acceptance,
+				output: report({ reviewFindings: ["prose must not become evidence"] }),
+				cwd,
+				requireCheckpoint: true,
+				checkpointEvidence: { reviewFindings: [], residualRisks: [] },
+			});
+			assert.equal(clean.status, "checked");
+			assert.deepEqual(clean.childReport?.reviewFindings, []);
+		} finally {
+			fs.rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
 	it("surfaces parse validation details in acceptance failure messages", async () => {
 		const cwd = tempRepo();
 		try {

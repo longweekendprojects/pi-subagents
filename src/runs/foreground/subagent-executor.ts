@@ -67,6 +67,7 @@ import { currentCompletionOwnerId } from "../../shared/completion-owner.ts";
 import { applyIntercomBridgeToAgent, INTERCOM_BRIDGE_MARKER, resolveIntercomBridge, resolveIntercomSessionTarget, resolveSubagentIntercomTarget, type IntercomBridgeState } from "../../intercom/intercom-bridge.ts";
 import { formatControlIntercomMessage, formatControlNoticeMessage, resolveControlConfig, shouldNotifyControlEvent } from "../shared/subagent-control.ts";
 import { resolveTurnBudgetConfig } from "../shared/turn-budget.ts";
+import { validateCheckpointPolicy } from "../shared/review-checkpoint.ts";
 import { formatSpawnBudget, getSpawnBudgetSnapshot, grantSpawnBudget, preflightSpawnBudget, preflightSpawnBudgetGrant, reserveSpawnBudget } from "../shared/spawn-budget.ts";
 import { claimRunFanoutBatch, claimRunFanoutBatchWithCommit, createRunFanoutBudget, decodeRunFanoutBudgetDescriptor, formatRunFanoutBudget, getRunFanoutBudgetSnapshot, readRunFanoutBudgetDescriptor, RunFanoutLimitError, RUN_FANOUT_BUDGET_ENV, writeRunFanoutBudgetDescriptor } from "../shared/run-fanout-budget.ts";
 import { validateToolBudgetConfig } from "../shared/tool-budget.ts";
@@ -150,6 +151,7 @@ import {
 	type ResolvedControlConfig,
 	type ResolvedTurnBudget,
 	type ResolvedToolBudget,
+	type ReviewCheckpointPolicy,
 	type RunFanoutBudgetDescriptor,
 	type SingleResult,
 	type ToolBudgetConfig,
@@ -260,6 +262,7 @@ interface TaskParam {
 	model?: string;
 	skill?: string | string[] | boolean;
 	outputSchema?: JsonSchemaObject;
+	checkpointPolicy?: ReviewCheckpointPolicy;
 	acceptance?: AcceptanceInput;
 	agentContract?: AgentContract;
 	toolBudget?: ToolBudgetConfig;
@@ -297,6 +300,8 @@ export interface SubagentParamsLike {
 	scheduleOrigin?: ScheduleOrigin;
 	workflowChildAsyncId?: string;
 	workflowParentDeadlineAt?: number;
+	/** Internal marker: the timeout came from the workflow deadline, so an agent default may still narrow it. */
+	workflowParentTimeoutDefault?: boolean;
 	suppressRoutineResultIntercom?: boolean;
 	/** Internal inherited cumulative run-tree budget. */
 	runFanoutBudget?: RunFanoutBudgetDescriptor;
@@ -317,6 +322,7 @@ export interface SubagentParamsLike {
 	/** Optional hard per-tool-call timeout (ms). Known-fast tools also have a default. */
 	toolTimeoutMs?: number;
 	turnBudget?: TurnBudgetConfig;
+	checkpointPolicy?: ReviewCheckpointPolicy;
 	/** Internal-only strict turn-boundary enforcement for versioned foreground delegation. */
 	enforceHardTurnLimit?: boolean;
 	toolBudget?: ToolBudgetConfig;
@@ -469,6 +475,7 @@ function promptAuditRedoParams(value: unknown, rewrittenTask: string): SubagentP
 	delete params.workflowKey;
 	delete params.workflowChildAsyncId;
 	delete params.workflowParentDeadlineAt;
+	delete params.workflowParentTimeoutDefault;
 	delete params.suppressRoutineResultIntercom;
 	if (params.worktree === true && Array.isArray(params.tasks)) delete params.cwd;
 	return params;
@@ -1750,6 +1757,7 @@ async function resumeAsyncRun(input: {
 		...(input.params.timeoutMs !== undefined ? { timeoutMs: input.params.timeoutMs } : {}),
 		...(input.absoluteDeadlineAt !== undefined ? { absoluteDeadlineAt: input.absoluteDeadlineAt } : {}),
 		...(input.params.turnBudget !== undefined ? { turnBudget: input.params.turnBudget } : {}),
+		...(input.params.checkpointPolicy !== undefined ? { checkpointPolicy: input.params.checkpointPolicy } : recoveryDescriptor?.checkpointPolicy ? { checkpointPolicy: recoveryDescriptor.checkpointPolicy } : {}),
 		...(input.params.toolBudget !== undefined ? { toolBudget: input.params.toolBudget } : {}),
 		capabilityCeiling: intersectSubagentCapabilityCeilings("capabilityCeiling" in target ? target.capabilityCeiling : undefined, recoveryDescriptor?.capabilityCeiling, resolveCurrentSubagentCapabilityCeiling(input.deps.state.currentSessionId)),
 		runFanoutBudget: input.params.runFanoutBudget ?? recoveryDescriptor?.runFanoutBudget ?? createRunFanoutBudget(runId, resolveMaxSubagentSpawnsPerRun(input.deps.config.maxSubagentSpawnsPerRun)),
@@ -2256,16 +2264,22 @@ function applySingleAgentLaunchDefaults(params: SubagentParamsLike, agents: Agen
 	if ((params.chain?.length ?? 0) > 0 || (params.tasks?.length ?? 0) > 0 || !params.agent) return params;
 	const agent = agents.find((candidate) => candidate.name === params.agent);
 	if (!agent) return params;
-	const parentTimeoutMs = params.timeoutMs === undefined && params.maxRuntimeMs === undefined && agent.defaultTimeoutMs === undefined && params.workflowParentDeadlineAt !== undefined
-		? Math.max(1, params.workflowParentDeadlineAt - Date.now())
-		: undefined;
+	const parentDefault = params.workflowParentTimeoutDefault === true;
+	const requestedTimeout = parentDefault
+		? agent.defaultTimeoutMs
+		: params.timeoutMs ?? params.maxRuntimeMs ?? agent.defaultTimeoutMs;
+	const clamped = clampWorkflowChildTimeout(requestedTimeout, params.workflowParentDeadlineAt);
+	const { workflowParentTimeoutDefault: _workflowParentTimeoutDefault, ...withoutMarker } = params;
+	const withoutInternalTimeout = params.workflowParentDeadlineAt === undefined
+		? withoutMarker
+		: (() => {
+			const { maxRuntimeMs: _maxRuntimeMs, ...withoutAlias } = withoutMarker;
+			return withoutAlias;
+		})();
 	return {
-		...params,
+		...withoutInternalTimeout,
 		...(params.async === undefined && agent.defaultAsync !== undefined ? { async: agent.defaultAsync } : {}),
-		...(params.timeoutMs === undefined && params.maxRuntimeMs === undefined && agent.defaultTimeoutMs !== undefined
-			? { timeoutMs: agent.defaultTimeoutMs }
-			: {}),
-		...(parentTimeoutMs !== undefined ? { timeoutMs: parentTimeoutMs } : {}),
+		...(clamped.timeoutMs !== undefined ? { timeoutMs: clamped.timeoutMs } : {}),
 		...(params.turnBudget === undefined && agent.defaultTurnBudget !== undefined
 			? { turnBudget: agent.defaultTurnBudget }
 			: {}),
@@ -2818,6 +2832,7 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 			acceptance: params.acceptance,
 			timeoutMs: data.timeoutMs,
 			turnBudget: data.turnBudget,
+			checkpointPolicy: params.checkpointPolicy,
 			toolBudget: data.toolBudget,
 			usageBudget: data.usageBudget,
 			configToolBudget: data.configToolBudget,
@@ -3266,6 +3281,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 			toolTimeoutMs: params.toolTimeoutMs,
 			configToolTimeoutMs: data.configToolTimeoutMs,
 			turnBudget: data.turnBudget,
+			checkpointPolicy: params.checkpointPolicy,
 			enforceHardTurnLimit: params.enforceHardTurnLimit,
 			toolBudget: effectiveToolBudget.toolBudget,
 			capabilityCeiling: data.capabilityCeiling,
@@ -3319,6 +3335,8 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		mode: "single",
 		runId,
 		timeoutMs: data.timeoutMs,
+		terminalCause: r.terminalCause,
+		...(params.checkpointPolicy ? { checkpointPolicy: params.checkpointPolicy } : {}),
 		results: [r],
 		...(data.turnBudget ? { turnBudget: data.turnBudget } : {}),
 		...(effectiveToolBudget.toolBudget ? { toolBudget: effectiveToolBudget.toolBudget } : {}),
@@ -3588,6 +3606,24 @@ export async function steerWorkflowChildByKey(input: {
 	}
 }
 
+export const WORKFLOW_CHILD_DEADLINE_RESERVE_MS = 1;
+
+/** Keeps every workflow child deadline strictly inside its parent deadline. */
+export function clampWorkflowChildTimeout(
+	requestedTimeoutMs: unknown,
+	parentDeadlineAt: number | undefined,
+	now = Date.now(),
+): { timeoutMs?: number; error?: string } {
+	if (parentDeadlineAt === undefined) {
+		return typeof requestedTimeoutMs === "number" ? { timeoutMs: requestedTimeoutMs } : {};
+	}
+	const available = Math.floor(parentDeadlineAt - now) - WORKFLOW_CHILD_DEADLINE_RESERVE_MS;
+	if (available <= 0) return { error: "Workflow deadline expired before a child could launch." };
+	if (requestedTimeoutMs === undefined) return { timeoutMs: available };
+	if (typeof requestedTimeoutMs !== "number") return {};
+	return { timeoutMs: Math.min(requestedTimeoutMs, available) };
+}
+
 export function prepareWorkflowLaunchParams(
 	workflowDefaults: SubagentParamsLike,
 	childParams: Record<string, unknown>,
@@ -3595,18 +3631,14 @@ export function prepareWorkflowLaunchParams(
 	workflowKey: string,
 	options: { missionDetached?: boolean; suppressRoutineResultIntercom?: boolean; runFanoutBudget?: RunFanoutBudgetDescriptor; parentDeadlineAt?: number } = {},
 ): SubagentParamsLike {
-	const parentTimeoutMs = options.parentDeadlineAt === undefined
-		|| childParams.timeoutMs !== undefined
-		|| childParams.maxRuntimeMs !== undefined
-		|| workflowDefaults.timeoutMs !== undefined
-		|| workflowDefaults.maxRuntimeMs !== undefined
-		? undefined
-		: Math.max(1, options.parentDeadlineAt - Date.now());
+	const requestedTimeoutMs = childParams.timeoutMs ?? childParams.maxRuntimeMs ?? workflowDefaults.timeoutMs ?? workflowDefaults.maxRuntimeMs;
+	const clampedTimeout = clampWorkflowChildTimeout(requestedTimeoutMs, options.parentDeadlineAt);
+	if (clampedTimeout.error) throw new Error(clampedTimeout.error);
 	if (typeof childParams.resume === "string") {
 		if (childParams.gate !== undefined || workflowDefaults.gate !== undefined) {
 			throw new Error("gate is not supported with retained resume; resume uses the retained child contract.");
 		}
-		const timeoutMs = childParams.timeoutMs ?? childParams.maxRuntimeMs ?? workflowDefaults.timeoutMs ?? workflowDefaults.maxRuntimeMs;
+		const timeoutMs = clampedTimeout.timeoutMs ?? requestedTimeoutMs;
 		const turnBudget = childParams.turnBudget ?? workflowDefaults.turnBudget;
 		const toolBudget = childParams.toolBudget ?? workflowDefaults.toolBudget;
 		const intercomBridge = childParams.intercomBridge ?? workflowDefaults.intercomBridge;
@@ -3621,6 +3653,7 @@ export function prepareWorkflowLaunchParams(
 			...(options.runFanoutBudget ? { runFanoutBudget: { ...options.runFanoutBudget, parentPath: `${options.runFanoutBudget.parentPath ? `${options.runFanoutBudget.parentPath}/` : ""}workflow[${workflowKey}]` } } : {}),
 			...(options.missionDetached ? { mission: false } : {}),
 			...(timeoutMs !== undefined ? { timeoutMs: timeoutMs as number } : {}),
+			...(options.parentDeadlineAt !== undefined ? { workflowParentDeadlineAt: options.parentDeadlineAt } : {}),
 			...(turnBudget !== undefined ? { turnBudget: turnBudget as TurnBudgetConfig } : {}),
 			...(toolBudget !== undefined ? { toolBudget: toolBudget as ToolBudgetConfig } : {}),
 			...(intercomBridge !== undefined ? { intercomBridge: intercomBridge as IntercomBridgeConfig } : {}),
@@ -3633,10 +3666,13 @@ export function prepareWorkflowLaunchParams(
 		...(options.missionDetached ? { mission: false } : {}),
 		workflowParentRunId: parentWorkflowRunId,
 		workflowKey,
-		...(parentTimeoutMs !== undefined ? { workflowParentDeadlineAt: options.parentDeadlineAt } : {}),
+		...(clampedTimeout.timeoutMs !== undefined ? { timeoutMs: clampedTimeout.timeoutMs } : {}),
+		...(requestedTimeoutMs === undefined && options.parentDeadlineAt !== undefined ? { workflowParentTimeoutDefault: true } : {}),
+		...(options.parentDeadlineAt !== undefined ? { workflowParentDeadlineAt: options.parentDeadlineAt } : {}),
 		...(options.runFanoutBudget ? { runFanoutBudget: { ...options.runFanoutBudget, parentPath: `${options.runFanoutBudget.parentPath ? `${options.runFanoutBudget.parentPath}/` : ""}workflow[${workflowKey}]` } } : {}),
 		...(options.suppressRoutineResultIntercom ? { suppressRoutineResultIntercom: true } : {}),
 	} as SubagentParamsLike;
+	if (options.parentDeadlineAt !== undefined) delete launchParams.maxRuntimeMs;
 	const normalizedGate = normalizeGateParams(launchParams);
 	if (!normalizedGate.ok) throw new Error(normalizedGate.error);
 	return normalizedGate.params;
@@ -4966,6 +5002,9 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		effectiveParams = applySingleAgentLaunchDefaults(effectiveParams, discoveredAgents);
 		const turnBudget = resolveTurnBudgetConfig(effectiveParams.turnBudget ?? deps.config.turnBudget);
 		if (turnBudget.error) return buildRequestedModeError(effectiveParams, turnBudget.error);
+		const checkpointPolicy = effectiveParams.checkpointPolicy === undefined ? undefined : validateCheckpointPolicy(effectiveParams.checkpointPolicy);
+		if (checkpointPolicy?.error) return buildRequestedModeError(effectiveParams, checkpointPolicy.error);
+		if (checkpointPolicy?.policy) effectiveParams = { ...effectiveParams, checkpointPolicy: checkpointPolicy.policy };
 		// An agent-level defaultContext is a preference, unlike an explicit request.
 		// Prefer fork only when the parent session is persisted and has a current leaf;
 		// otherwise use fresh immediately instead of launching a guaranteed-to-fail fork.

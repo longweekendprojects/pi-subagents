@@ -30,6 +30,7 @@ import {
 import { writeAtomicJson } from "../../shared/atomic-json.ts";
 import { sanitizeProcessTerminal } from "../background/process-terminal.ts";
 import { THINKING_LEVELS } from "../../shared/model-info.ts";
+import { projectCheckpointEvidence, validateCheckpointPolicy, validateReviewCheckpointRecord } from "./review-checkpoint.ts";
 
 export const NESTED_EVENTS_DIR = path.join(TEMP_ROOT_DIR, "nested-subagent-events");
 const ROUTE_FILE = "route.json";
@@ -39,6 +40,21 @@ const MAX_EVENT_BYTES = 64 * 1024;
 const MAX_STEPS = 12;
 const MAX_CHILDREN = 16;
 const MAX_DEPTH = 3;
+const TERMINAL_CAUSES = new Set(["completed", "explicit-stop", "workflow-deadline", "interrupt", "turn-budget", "tool-timeout", "protocol-failure", "process-signal", "process-failure", "spawn-failure"]);
+
+function sanitizeTerminalCause(value: unknown): import("../../shared/types.ts").TerminalCause | undefined {
+	return typeof value === "string" && TERMINAL_CAUSES.has(value)
+		? value as import("../../shared/types.ts").TerminalCause
+		: undefined;
+}
+
+function sanitizeCheckpoints(value: unknown): import("../../shared/types.ts").ReviewCheckpointRecord[] {
+	if (!Array.isArray(value)) return [];
+	return value.flatMap((record) => {
+		const valid = validateReviewCheckpointRecord(record);
+		return valid ? [valid] : [];
+	});
+}
 
 type NestedStatusEventType = "subagent.nested.started" | "subagent.nested.updated" | "subagent.nested.completed";
 type NestedControlResultEventType = "subagent.nested.control-result";
@@ -299,6 +315,9 @@ function sanitizeStep(input: unknown, depth: number): NestedStepSummary | undefi
 		: "pending";
 	const model = stringValue(raw.model);
 	const thinking = THINKING_LEVELS.find((level) => level === raw.thinking);
+	const checkpointPolicy = raw.checkpointPolicy === undefined ? undefined : validateCheckpointPolicy(raw.checkpointPolicy).policy;
+	const reviewCheckpoints = checkpointPolicy ? sanitizeCheckpoints(raw.reviewCheckpoints) : [];
+	const checkpointEvidence = projectCheckpointEvidence(reviewCheckpoints);
 	return {
 		agent,
 		status,
@@ -317,6 +336,10 @@ function sanitizeStep(input: unknown, depth: number): NestedStepSummary | undefi
 		...(stringValue(raw.error, 1024) ? { error: stringValue(raw.error, 1024) } : {}),
 		...(raw.timedOut === true ? { timedOut: true } : {}),
 		...(raw.stopped === true ? { stopped: true } : {}),
+		...(sanitizeTerminalCause(raw.terminalCause) ? { terminalCause: sanitizeTerminalCause(raw.terminalCause) } : {}),
+		...(checkpointPolicy ? { checkpointPolicy } : {}),
+		...(reviewCheckpoints.length ? { reviewCheckpoints } : {}),
+		...(checkpointEvidence ? { reviewFindings: checkpointEvidence.reviewFindings, residualRisks: checkpointEvidence.residualRisks } : {}),
 		...(sanitizeTurnBudget(raw.turnBudget) ? { turnBudget: sanitizeTurnBudget(raw.turnBudget) } : {}),
 		...(raw.turnBudgetExceeded === true ? { turnBudgetExceeded: true } : {}),
 		...(raw.wrapUpRequested === true ? { wrapUpRequested: true } : {}),
@@ -336,6 +359,9 @@ export function sanitizeSummary(input: unknown, depth = 0): NestedRunSummary | u
 		: undefined;
 	const totalTokens = sanitizeTokenUsage(raw.totalTokens);
 	const totalCost = sanitizeCost(raw.totalCost);
+	const checkpointPolicy = raw.checkpointPolicy === undefined ? undefined : validateCheckpointPolicy(raw.checkpointPolicy).policy;
+	const reviewCheckpoints = checkpointPolicy ? sanitizeCheckpoints(raw.reviewCheckpoints) : [];
+	const checkpointEvidence = projectCheckpointEvidence(reviewCheckpoints);
 	return {
 		id: raw.id,
 		parentRunId: raw.parentRunId,
@@ -377,6 +403,10 @@ export function sanitizeSummary(input: unknown, depth = 0): NestedRunSummary | u
 		...(clampNumber(raw.deadlineAt) !== undefined ? { deadlineAt: clampNumber(raw.deadlineAt) } : {}),
 		...(raw.timedOut === true ? { timedOut: true } : {}),
 		...(raw.stopped === true ? { stopped: true } : {}),
+		...(sanitizeTerminalCause(raw.terminalCause) ? { terminalCause: sanitizeTerminalCause(raw.terminalCause) } : {}),
+		...(checkpointPolicy ? { checkpointPolicy } : {}),
+		...(reviewCheckpoints.length ? { reviewCheckpoints } : {}),
+		...(checkpointEvidence ? { reviewFindings: checkpointEvidence.reviewFindings, residualRisks: checkpointEvidence.residualRisks } : {}),
 		...(sanitizeTurnBudget(raw.turnBudget) ? { turnBudget: sanitizeTurnBudget(raw.turnBudget) } : {}),
 		...(raw.turnBudgetExceeded === true ? { turnBudgetExceeded: true } : {}),
 		...(raw.wrapUpRequested === true ? { wrapUpRequested: true } : {}),
@@ -1023,6 +1053,11 @@ export function nestedSummaryFromAsyncStatus(status: AsyncStatus, asyncDir: stri
 		...(status.deadlineAt !== undefined ? { deadlineAt: status.deadlineAt } : {}),
 		...(status.timedOut !== undefined ? { timedOut: status.timedOut } : {}),
 		...(status.stopped !== undefined ? { stopped: status.stopped } : {}),
+		...(status.terminalCause ? { terminalCause: status.terminalCause } : {}),
+		...(status.checkpointPolicy ? { checkpointPolicy: status.checkpointPolicy } : {}),
+		...(status.reviewCheckpoints ? { reviewCheckpoints: status.reviewCheckpoints } : {}),
+		...(status.reviewFindings !== undefined ? { reviewFindings: status.reviewFindings } : {}),
+		...(status.residualRisks !== undefined ? { residualRisks: status.residualRisks } : {}),
 		...(status.turnBudget ? { turnBudget: status.turnBudget } : {}),
 		...(status.turnBudgetExceeded !== undefined ? { turnBudgetExceeded: status.turnBudgetExceeded } : {}),
 		...(status.wrapUpRequested !== undefined ? { wrapUpRequested: status.wrapUpRequested } : {}),
@@ -1051,6 +1086,11 @@ export function nestedSummaryFromAsyncStatus(status: AsyncStatus, asyncDir: stri
 			...runtimeAcknowledgedEntry(step.runtimeAcknowledgedExtensions),
 			...(step.timedOut !== undefined ? { timedOut: step.timedOut } : {}),
 			...(step.stopped !== undefined ? { stopped: step.stopped } : {}),
+			...(step.terminalCause ? { terminalCause: step.terminalCause } : {}),
+			...(step.checkpointPolicy ? { checkpointPolicy: step.checkpointPolicy } : {}),
+			...(step.reviewCheckpoints ? { reviewCheckpoints: step.reviewCheckpoints } : {}),
+			...(step.reviewFindings !== undefined ? { reviewFindings: step.reviewFindings } : {}),
+			...(step.residualRisks !== undefined ? { residualRisks: step.residualRisks } : {}),
 			...(step.turnBudget ? { turnBudget: step.turnBudget } : {}),
 			...(step.turnBudgetExceeded !== undefined ? { turnBudgetExceeded: step.turnBudgetExceeded } : {}),
 			...(step.wrapUpRequested !== undefined ? { wrapUpRequested: step.wrapUpRequested } : {}),
