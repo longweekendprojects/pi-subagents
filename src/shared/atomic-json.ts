@@ -19,6 +19,7 @@ type AtomicJsonWriterOptions = {
 	retryDirectoryErrors?: boolean;
 	retryDelaysMs?: readonly number[];
 	wait?: (delayMs: number) => void;
+	platform?: NodeJS.Platform;
 };
 
 type DestinationPreimage =
@@ -65,6 +66,17 @@ function syncPath(fsImpl: AtomicJsonFs, targetPath: string): void {
 	}
 }
 
+/** Node cannot flush directory handles on Windows; retain file fsync and atomic rename there. */
+function syncDirectoryPath(fsImpl: AtomicJsonFs, targetPath: string, platform: NodeJS.Platform): void {
+	try {
+		syncPath(fsImpl, targetPath);
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (platform === "win32" && (code === "EPERM" || code === "EINVAL")) return;
+		throw error;
+	}
+}
+
 function readDestinationPreimage(fsImpl: AtomicJsonFs, filePath: string): DestinationPreimage {
 	if (!fsImpl.readFileSync) throw new Error("Durable atomic replacement requires readFileSync to preserve the destination pre-image.");
 	try {
@@ -86,12 +98,13 @@ function restoreDestinationPreimage(input: {
 	mode?: number;
 	retryDelaysMs: readonly number[];
 	wait: (delayMs: number) => void;
+	platform: NodeJS.Platform;
 }): void {
 	let rollbackTempPath: string | undefined;
 	try {
 		if (!input.preimage.exists) {
 			input.fsImpl.rmSync(input.filePath, { force: true });
-			syncPath(input.fsImpl, path.dirname(input.filePath));
+			syncDirectoryPath(input.fsImpl, path.dirname(input.filePath), input.platform);
 			return;
 		}
 		rollbackTempPath = path.join(
@@ -105,7 +118,7 @@ function restoreDestinationPreimage(input: {
 		);
 		syncPath(input.fsImpl, rollbackTempPath);
 		renameWithRetry(input.fsImpl, rollbackTempPath, input.filePath, input.retryDelaysMs, input.wait);
-		syncPath(input.fsImpl, path.dirname(input.filePath));
+		syncDirectoryPath(input.fsImpl, path.dirname(input.filePath), input.platform);
 	} catch {
 		// The original post-rename durability failure is authoritative. Review
 		// checkpoint generations remain unacknowledged if restoration also fails.
@@ -130,6 +143,7 @@ export function createAtomicJsonWriter(options: AtomicJsonWriterOptions = {}): (
 	const retryRenameErrors = options.retryRenameErrors ?? process.platform === "win32";
 	const retryDirectoryErrors = options.retryDirectoryErrors ?? retryRenameErrors;
 	const retryDelaysMs = options.retryDelaysMs ?? DEFAULT_FILE_SYSTEM_RETRY_DELAYS_MS;
+	const platform = options.platform ?? process.platform;
 	const renameRetryDelaysMs = retryRenameErrors ? retryDelaysMs : [];
 	const directoryRetryDelaysMs = retryDirectoryErrors ? retryDelaysMs : [];
 	const wait = options.wait ?? waitForFileSystemRetry;
@@ -149,7 +163,7 @@ export function createAtomicJsonWriter(options: AtomicJsonWriterOptions = {}): (
 			if (durable) syncPath(fsImpl, tempPath);
 			renameWithRetry(fsImpl, tempPath, filePath, renameRetryDelaysMs, wait);
 			renamed = true;
-			if (durable) syncPath(fsImpl, path.dirname(filePath));
+			if (durable) syncDirectoryPath(fsImpl, path.dirname(filePath), platform);
 		} catch (error) {
 			writeError = error;
 			if (durable && renamed && preimage) {
@@ -163,6 +177,7 @@ export function createAtomicJsonWriter(options: AtomicJsonWriterOptions = {}): (
 					mode,
 					retryDelaysMs: renameRetryDelaysMs,
 					wait,
+					platform,
 				});
 			}
 			throw error;
