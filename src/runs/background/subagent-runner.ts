@@ -88,7 +88,7 @@ import { readChildToolDiagnosticError } from "../shared/tool-availability.ts";
 import { collectDynamicResults, DynamicFanoutError, materializeDynamicParallelStep, validateDynamicCollection } from "../shared/dynamic-fanout.ts";
 import { claimRunFanoutBatch, getRunFanoutBudgetSnapshot } from "../shared/run-fanout-budget.ts";
 import { nestedSummaryFromAsyncStatus, projectNestedEvents, resolveNestedAsyncDir, writeNestedEvent } from "../shared/nested-events.ts";
-import { formatModelAttemptNote, isRetryableModelFailure } from "../shared/model-fallback.ts";
+import { classifyAssistantProviderFailure, formatModelAttemptNote, isRetryableModelFailure } from "../shared/model-fallback.ts";
 import {
 	SUBAGENT_STARTUP_RETRY_DELAYS_MS,
 	formatSubagentExtensionConflictError,
@@ -608,6 +608,7 @@ function runPiStreaming(
 		}
 		let error: string | undefined = writerRegistrationError;
 		let assistantError: string | undefined;
+		let pendingProviderFailure: ReturnType<typeof classifyAssistantProviderFailure>;
 		let interrupted = false;
 		let timedOut = false;
 		let stopped = false;
@@ -737,7 +738,18 @@ function runPiStreaming(
 
 				if (event.type !== "message_end" || event.message.role !== "assistant") return;
 				if (event.message.model) model = event.message.model;
-				if (event.message.errorMessage) assistantError = event.message.errorMessage;
+				const providerFailure = classifyAssistantProviderFailure(
+					(event.message as { stopReason?: unknown }).stopReason,
+					event.message.errorMessage,
+				);
+				if (providerFailure?.terminalCause === "rate-limit") {
+					terminateForRateLimit(providerFailure.error);
+				} else if (providerFailure && terminalCause === undefined) {
+					pendingProviderFailure = providerFailure;
+					assistantError = providerFailure.error;
+				} else if (event.message.errorMessage && terminalCause === undefined) {
+					assistantError = event.message.errorMessage;
+				}
 				const eventUsage = event.message.usage;
 				if (eventUsage) {
 					usage.turns++;
@@ -748,7 +760,10 @@ function runPiStreaming(
 					usage.cost += eventUsage.cost?.total ?? 0;
 				}
 				if (isTerminalAssistantStop(event.message)) {
-					if (!event.message.errorMessage && extractTextFromContent(event.message.content).trim()) assistantError = undefined;
+					if (!event.message.errorMessage && extractTextFromContent(event.message.content).trim() && terminalCause === undefined) {
+						assistantError = undefined;
+						pendingProviderFailure = undefined;
+					}
 					cleanTerminalAssistantStopReceived ||= !event.message.errorMessage;
 					applyChildLifecycle(projectChildLifecycle(event, true));
 				}
@@ -769,6 +784,7 @@ function runPiStreaming(
 		let turnBudgetTerminationTimer: NodeJS.Timeout | undefined;
 		let turnBudgetHardKillTimer: NodeJS.Timeout | undefined;
 		let protocolHardKillTimer: NodeJS.Timeout | undefined;
+		let rateLimitHardKillTimer: NodeJS.Timeout | undefined;
 		let protocolError: ProtocolOutputLimit | undefined;
 		let settled = false;
 		applyChildLifecycle = (action: ChildLifecycleAction): void => {
@@ -836,6 +852,21 @@ function runPiStreaming(
 			error = message;
 			if (processTreeController) void processTreeController.terminate();
 			else trySignalChild(child, "SIGTERM");
+		};
+		const terminateForRateLimit = (message: string): boolean => {
+			if (settled || timedOut || stopped || !claimTerminalCause("rate-limit")) return false;
+			interrupted = false;
+			error = message;
+			if (process.platform !== "win32" && processTreeController) {
+				void processTreeController.terminate();
+			} else {
+				trySignalChild(child, "SIGTERM");
+				rateLimitHardKillTimer = setTimeout(() => {
+					if (!settled && !childExited) trySignalChild(child, "SIGKILL");
+				}, 3000);
+				rateLimitHardKillTimer.unref?.();
+			}
+			return true;
 		};
 		let toolTimeoutSequence = 0;
 		const activeToolTimeouts = new Map<string, { toolName: string; timer: ReturnType<typeof setTimeout> }>();
@@ -928,6 +959,10 @@ function runPiStreaming(
 				clearTimeout(protocolHardKillTimer);
 				protocolHardKillTimer = undefined;
 			}
+			if (rateLimitHardKillTimer) {
+				clearTimeout(rateLimitHardKillTimer);
+				rateLimitHardKillTimer = undefined;
+			}
 		};
 		function startFinalDrain(): void {
 			if (childWatchdogIsActive(childWatchdogState)) {
@@ -1009,7 +1044,11 @@ function runPiStreaming(
 				turnBudgetExceeded,
 				forcedDrainAfterFinalSuccess,
 			}) ? formatProcessSignalError(signal!) : undefined;
-			claimTerminalCause(signal ? "process-signal" : (exitCode === 0 && !finalError ? "completed" : "process-failure"));
+			claimTerminalCause(signal
+				? "process-signal"
+				: pendingProviderFailure?.terminalCause === "provider-error"
+					? "provider-error"
+					: exitCode === 0 && !finalError ? "completed" : "process-failure");
 			resolve(omitUndefinedProperties({
 				stderr,
 				exitCode: timedOut || stopped ? 1 : turnBudgetExceeded ? 1 : interrupted || forcedDrainAfterFinalSuccess ? 0 : forcedTerminationSignal || signal ? (exitCode ?? 1) : exitCode,

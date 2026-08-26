@@ -309,6 +309,8 @@ export function buildModelCandidates(
 	return candidates;
 }
 
+const RATE_LIMIT_PROVIDER_ERROR_PATTERN = /\b(?:429|rate[\s_-]*limit(?:[\s_-]*(?:exceeded|error))?|too[\s_-]*many[\s_-]*requests|usage[\s_-]*limit|quota[\s_-]*(?:exceeded|exhausted)|resource[\s_-]*exhausted)\b/i;
+
 const RETRYABLE_MODEL_FAILURE_PATTERNS = [
 	/rate\s*limit/i,
 	/usage\s*limit/i,
@@ -356,6 +358,31 @@ const RETRYABLE_MODEL_FAILURE_PATTERNS = [
  * include namespaced forms like `mcp.server/write`.
  */
 const TOOL_FAILURE_PREFIX = /^[\w.:@/-]+ failed (?:(?:\(exit \d+\):)|(?:with exit code \d+))(?:\s|$)/i;
+
+export interface AssistantProviderFailure {
+	terminalCause: "rate-limit" | "provider-error";
+	/** Exact provider text retained for terminal result projection. */
+	error: string;
+}
+
+/**
+ * Classifies provider failures emitted in assistant terminal events without
+ * mistaking task-tool failures for provider failures. Older Pi event streams
+ * omit stopReason, so an errorMessage without a contradictory clean stop is
+ * treated as a provider error for backward-compatible recovery.
+ */
+export function classifyAssistantProviderFailure(
+	stopReason: unknown,
+	errorMessage: unknown,
+): AssistantProviderFailure | undefined {
+	if (typeof errorMessage !== "string" || errorMessage.length === 0) return undefined;
+	if (stopReason !== undefined && stopReason !== "error") return undefined;
+	if (TOOL_FAILURE_PREFIX.test(errorMessage.trim())) return undefined;
+	return {
+		terminalCause: RATE_LIMIT_PROVIDER_ERROR_PATTERN.test(errorMessage) ? "rate-limit" : "provider-error",
+		error: errorMessage,
+	};
+}
 
 export function isRetryableModelFailure(error: string | undefined): boolean {
 	if (!error) return false;

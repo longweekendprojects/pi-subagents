@@ -354,12 +354,19 @@ function registerReviewCheckpoint(pi: ExtensionAPI): void {
 	let assistantTurn = recovered.assistantTurn;
 	let checkpointCompleted = recovered.checkpointSatisfied;
 	let permanentFinalization = recovered.permanentFinalization;
+	let durableFinalCheckpoint = recovered.records.some((record) => record.submission.kind === "final");
 	let gateStateError: string | undefined;
 	let investigativeCallAdmittedThisTurn = false;
 	let checkpointBoundaryThisTurn = false;
 	let pendingFinalizationThisTurn = false;
+	let activeLifecycle = false;
+	let activeContext: ExtensionContext | undefined;
+	let finalizationTimer: ReturnType<typeof setTimeout> | undefined;
+	let finalizationInterruptionSent = false;
+	let sessionShutdown = false;
 	const structuredOutputActive = Boolean(process.env[STRUCTURED_OUTPUT_CAPTURE_ENV]);
-	const onRuntimeEvent = pi.on as unknown as (event: string, handler: (event: { toolName?: unknown; input?: unknown }) => unknown) => void;
+	const sendUserMessage = (pi as { sendUserMessage?: (content: string, options: { deliverAs: "steer" }) => unknown }).sendUserMessage;
+	const onRuntimeEvent = pi.on as unknown as (event: string, handler: (event: { toolName?: unknown; input?: unknown }, ctx?: ExtensionContext) => unknown) => void;
 	const finalizationIsDue = (): boolean => assistantTurn >= policy.requiredByTurn + policy.reserveTurns
 		|| (finalizeAt !== undefined && Date.now() >= finalizeAt);
 	const persistGateState = (nextPermanentFinalization = permanentFinalization): boolean => {
@@ -381,6 +388,46 @@ function registerReviewCheckpoint(pi: ExtensionAPI): void {
 			return false;
 		}
 	};
+	const clearFinalizationTimer = (): void => {
+		if (!finalizationTimer) return;
+		clearTimeout(finalizationTimer);
+		finalizationTimer = undefined;
+	};
+	const absoluteFinalizationIsDue = (): boolean => finalizeAt !== undefined && Date.now() >= finalizeAt;
+	const finalizeActiveTurn = (): boolean => {
+		if (durableFinalCheckpoint) return permanentFinalization;
+		if (!permanentFinalization) {
+			if (!absoluteFinalizationIsDue()) return false;
+			if (!persistGateState(true)) return true;
+		}
+		if (finalizationInterruptionSent || !activeContext) return true;
+		finalizationInterruptionSent = true;
+		try {
+			activeContext.abort();
+		} catch {
+			// The permanent latch remains authoritative when an abort callback fails.
+		}
+		try {
+			sendUserMessage?.(
+				"Review checkpoint finalization is required now. Immediately checkpoint every confirmed finding, submit the final status, and return your final response. Do not investigate further.",
+				{ deliverAs: "steer" },
+			);
+		} catch {
+			// The durable finalization latch still blocks investigation if steering fails.
+		}
+		return true;
+	};
+	const armFinalizationTimer = (ctx?: ExtensionContext): void => {
+		if (ctx) activeContext = ctx;
+		clearFinalizationTimer();
+		if (!finalizeAt || !activeLifecycle || sessionShutdown || durableFinalCheckpoint || finalizationInterruptionSent) return;
+		const delay = Math.max(0, finalizeAt - Date.now());
+		finalizationTimer = setTimeout(() => {
+			finalizationTimer = undefined;
+			finalizeActiveTurn();
+		}, delay);
+		finalizationTimer.unref?.();
+	};
 	const beginFinalizationIfDue = (): boolean => permanentFinalization || finalizationIsDue();
 	const allowsFinalizationTool = (toolName: string): boolean => toolName === REVIEW_CHECKPOINT_TOOL_NAME || (toolName === "structured_output" && structuredOutputActive);
 	const checkpointToolValue = (input: unknown): unknown => input && typeof input === "object" && !Array.isArray(input) && Object.hasOwn(input, "value")
@@ -390,15 +437,41 @@ function registerReviewCheckpoint(pi: ExtensionAPI): void {
 		const value = checkpointToolValue(input);
 		return Boolean(value) && typeof value === "object" && !Array.isArray(value) && (value as { kind?: unknown }).kind === "final";
 	};
-	onRuntimeEvent("turn_start", () => {
+	onRuntimeEvent("agent_start", (_event, ctx) => {
+		activeLifecycle = true;
+		if (ctx) activeContext = ctx;
+		if (absoluteFinalizationIsDue()) finalizeActiveTurn();
+		else armFinalizationTimer(ctx);
+		return undefined;
+	});
+	onRuntimeEvent("turn_start", (_event, ctx) => {
+		activeLifecycle = true;
+		if (ctx) activeContext = ctx;
 		assistantTurn += 1;
 		investigativeCallAdmittedThisTurn = false;
 		checkpointBoundaryThisTurn = false;
 		pendingFinalizationThisTurn = false;
 		persistGateState();
+		if (absoluteFinalizationIsDue()) finalizeActiveTurn();
+		else armFinalizationTimer(ctx);
 		return undefined;
 	});
-	onRuntimeEvent("tool_call", (event) => {
+	onRuntimeEvent("agent_end", () => {
+		activeLifecycle = false;
+		activeContext = undefined;
+		clearFinalizationTimer();
+		return undefined;
+	});
+	onRuntimeEvent("session_shutdown", () => {
+		sessionShutdown = true;
+		activeLifecycle = false;
+		activeContext = undefined;
+		clearFinalizationTimer();
+		return undefined;
+	});
+	onRuntimeEvent("tool_call", (event, ctx) => {
+		if (ctx) activeContext = ctx;
+		if (absoluteFinalizationIsDue()) finalizeActiveTurn();
 		const toolName = typeof event.toolName === "string" ? event.toolName : "tool";
 		const checkpointFinal = toolName === REVIEW_CHECKPOINT_TOOL_NAME && finalCheckpointInput(event.input);
 		if (toolName === REVIEW_CHECKPOINT_TOOL_NAME) {
@@ -478,7 +551,11 @@ function registerReviewCheckpoint(pi: ExtensionAPI): void {
 			checkpointCompleted = true;
 			gateStateError = undefined;
 			// The receipt and its durable gate state permanently close investigation.
-			if (submission.submission.kind === "final") permanentFinalization = true;
+			if (submission.submission.kind === "final") {
+				permanentFinalization = true;
+				durableFinalCheckpoint = true;
+				clearFinalizationTimer();
+			}
 			return {
 				content: [{ type: "text", text: "Review checkpoint persisted." }],
 				details: { reviewCheckpoint: record },

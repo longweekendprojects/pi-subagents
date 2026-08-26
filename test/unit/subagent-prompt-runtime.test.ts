@@ -18,7 +18,7 @@ import {
 } from "../../src/runs/shared/pi-args.ts";
 import { RUNTIME_EXTENSION_ACK_EVENT, RUNTIME_EXTENSION_ACK_PATH_ENV } from "../../src/runs/shared/runtime-acknowledged-extensions.ts";
 import { STRUCTURED_OUTPUT_CAPTURE_ENV, STRUCTURED_OUTPUT_SCHEMA_ENV } from "../../src/runs/shared/structured-output.ts";
-import { REVIEW_CHECKPOINT_FINALIZE_AT_ENV, REVIEW_CHECKPOINT_POLICY_ENV, REVIEW_CHECKPOINT_STORE_ENV, REVIEW_CHECKPOINT_TOOL_NAME } from "../../src/runs/shared/review-checkpoint.ts";
+import { REVIEW_CHECKPOINT_FINALIZE_AT_ENV, REVIEW_CHECKPOINT_POLICY_ENV, REVIEW_CHECKPOINT_STORE_ENV, REVIEW_CHECKPOINT_TOOL_NAME, readReviewCheckpointStoreState } from "../../src/runs/shared/review-checkpoint.ts";
 import { TOOL_BUDGET_ENV } from "../../src/runs/shared/tool-budget.ts";
 import { PERMISSION_POLICY_ENV } from "../../src/runs/shared/permissions.ts";
 import { CHILD_TOOL_DIAGNOSTIC_PATH_ENV, formatChildToolDiagnostic, MCP_DIRECT_CHILD_TOOLS_ENV, readChildToolDiagnostic, REQUIRED_CHILD_TOOLS_ENV } from "../../src/runs/shared/tool-availability.ts";
@@ -276,6 +276,67 @@ describe("subagent prompt runtime", () => {
 			assert.equal(await turnThree.blocked(REVIEW_CHECKPOINT_TOOL_NAME, { value: { kind: "progress", status: "no-confirmed-finding-yet" } }), false);
 			await turnThree.tool().execute("progress", { value: { kind: "progress", status: "no-confirmed-finding-yet" } });
 			assert.equal(await turnThree.blocked("bash"), true, "a checkpoint cannot reopen investigation in the same turn");
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("proactively finalizes an active review turn once and keeps final checkpoint submission available", async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "subagent-review-finalize-runtime-"));
+		try {
+			const storePath = path.join(dir, "checkpoint.json");
+			process.env[REVIEW_CHECKPOINT_POLICY_ENV] = JSON.stringify({ version: 1 });
+			process.env[REVIEW_CHECKPOINT_STORE_ENV] = storePath;
+			process.env[REVIEW_CHECKPOINT_FINALIZE_AT_ENV] = String(Date.now() + 25);
+			process.env[STRUCTURED_OUTPUT_CAPTURE_ENV] = path.join(dir, "structured.json");
+			process.env[SUBAGENT_RUN_ID_ENV] = "finalize-run";
+			process.env[SUBAGENT_CHILD_AGENT_ENV] = "reviewer";
+			process.env[SUBAGENT_CHILD_INDEX_ENV] = "0";
+			const handlers = new Map<string, Array<(event?: { toolName?: string; input?: unknown }, ctx?: { abort(): void }) => unknown>>();
+			let checkpointTool: { execute: (_id: string, params: { value: unknown }) => Promise<unknown> } | undefined;
+			const sent: Array<{ content: string; deliverAs?: string }> = [];
+			let aborts = 0;
+			const ctx = { abort() { aborts += 1; } };
+			registerSubagentPromptRuntime({
+				on(event: string, handler: (event?: { toolName?: string; input?: unknown }, runtimeCtx?: { abort(): void }) => unknown) {
+					handlers.set(event, [...(handlers.get(event) ?? []), handler]);
+				},
+				registerTool(tool: { name: string; execute: (_id: string, params: { value: unknown }) => Promise<unknown> }) {
+					if (tool.name === REVIEW_CHECKPOINT_TOOL_NAME) checkpointTool = tool;
+				},
+				sendUserMessage(content: string, options?: { deliverAs?: string }) {
+					sent.push({ content, deliverAs: options?.deliverAs });
+				},
+			} as never);
+			const emit = async (event: string, payload: { toolName?: string; input?: unknown } = {}): Promise<void> => {
+				await Promise.all((handlers.get(event) ?? []).map((handler) => handler(payload, ctx)));
+			};
+			const blocked = async (toolName: string, input?: unknown): Promise<boolean> => {
+				const decisions = await Promise.all((handlers.get("tool_call") ?? []).map((handler) => handler({ toolName, input }, ctx)));
+				return decisions.some((decision) => (decision as { block?: boolean } | undefined)?.block === true);
+			};
+
+			await emit("agent_start");
+			const deadline = Date.now() + 1_000;
+			while (aborts === 0 && Date.now() < deadline) {
+				await new Promise((resolve) => setTimeout(resolve, 10));
+			}
+			assert.equal(aborts, 1, "the active model turn must be aborted at finalizeAt");
+			assert.equal(sent.length, 1, "finalization sends exactly one steering message");
+			assert.equal(sent[0]?.deliverAs, "steer");
+			assert.match(sent[0]?.content ?? "", /checkpoint every confirmed finding.*final status.*final response/i);
+			assert.equal(readReviewCheckpointStoreState(storePath, { runId: "finalize-run", agent: "reviewer", childIndex: 0 }).permanentFinalization, true);
+			assert.equal(await blocked("read"), true, "permanent finalization blocks investigation");
+			assert.equal(await blocked("structured_output"), false, "active structured output remains allowed");
+			assert.equal(await blocked(REVIEW_CHECKPOINT_TOOL_NAME, { value: { kind: "final", status: "complete" } }), false, "the final checkpoint remains retryable after the latch");
+			assert.ok(checkpointTool, "review_checkpoint must register");
+			await checkpointTool.execute("final", { value: { kind: "final", status: "complete" } });
+			assert.equal(readReviewCheckpointStoreState(storePath, { runId: "finalize-run", agent: "reviewer", childIndex: 0 }).records.at(-1)?.submission.kind, "final");
+
+			await emit("agent_start");
+			await new Promise((resolve) => setTimeout(resolve, 40));
+			assert.equal(aborts, 1, "a durable final checkpoint clears later timer work");
+			assert.equal(sent.length, 1, "a durable final checkpoint does not resend steering");
 		} finally {
 			fs.rmSync(dir, { recursive: true, force: true });
 		}

@@ -74,9 +74,11 @@ import { readChildToolDiagnosticError } from "../shared/tool-availability.ts";
 import { captureSingleOutputSnapshot, extractChildWrittenOutput, finalizeSingleOutput, formatSavedOutputReference, injectOutputPathSystemPrompt, resolveSingleOutput, validateFileOnlyOutputMode, type SingleOutputSnapshot } from "../shared/single-output.ts";
 import {
 	buildModelCandidates,
+	classifyAssistantProviderFailure,
 	formatModelAttemptNote,
 	isRetryableModelFailure,
 } from "../shared/model-fallback.ts";
+import { createOwnedProcessTreeController } from "../background/owned-process-tree.ts";
 import {
 	SUBAGENT_STARTUP_RETRY_DELAYS_MS,
 	formatSubagentExtensionConflictError,
@@ -518,13 +520,18 @@ async function runSingleAttempt(
 			env: spawnEnv,
 			stdio: ["ignore", "pipe", "pipe"],
 			windowsHide: true,
+			detached: process.platform !== "win32",
 		});
+		const processTreeController = typeof proc.pid === "number"
+			? createOwnedProcessTreeController(proc.pid)
+			: undefined;
 		const jsonlWriter = createJsonlWriter(shared.jsonlPath, proc.stdout);
 		let processClosed = false;
 		let lifecycleFinished = false;
 		let detached = false;
 		let intercomStarted = false;
 		let assistantError: string | undefined;
+		let pendingProviderFailure: ReturnType<typeof classifyAssistantProviderFailure>;
 		let removeAbortListener: (() => void) | undefined;
 		let removeInterruptListener: (() => void) | undefined;
 		let activityTimer: NodeJS.Timeout | undefined;
@@ -532,6 +539,7 @@ async function runSingleAttempt(
 		let timeoutTerminationTimer: NodeJS.Timeout | undefined;
 		let timeoutHardKillTimer: NodeJS.Timeout | undefined;
 		let abortHardKillTimer: NodeJS.Timeout | undefined;
+		let rateLimitHardKillTimer: NodeJS.Timeout | undefined;
 		let turnBudgetSoftReached = false;
 		let turnBudgetTerminationTimer: NodeJS.Timeout | undefined;
 		let turnBudgetHardKillTimer: NodeJS.Timeout | undefined;
@@ -709,6 +717,10 @@ async function runSingleAttempt(
 			if (abortHardKillTimer) {
 				clearTimeout(abortHardKillTimer);
 				abortHardKillTimer = undefined;
+			}
+			if (rateLimitHardKillTimer) {
+				clearTimeout(rateLimitHardKillTimer);
+				rateLimitHardKillTimer = undefined;
 			}
 			if (protocolHardKillTimer) {
 				clearTimeout(protocolHardKillTimer);
@@ -1068,12 +1080,23 @@ async function runSingleAttempt(
 						progress.model = evt.message.model;
 						if (!result.model) result.model = evt.message.model;
 					}
-					if (evt.message.errorMessage) assistantError = evt.message.errorMessage;
+					const providerFailure = classifyAssistantProviderFailure(stopReason, evt.message.errorMessage);
+					if (providerFailure?.terminalCause === "rate-limit") {
+						terminateForRateLimit(providerFailure.error);
+					} else if (providerFailure && result.terminalCause === undefined) {
+						pendingProviderFailure = providerFailure;
+						assistantError = providerFailure.error;
+					} else if (evt.message.errorMessage && result.terminalCause === undefined) {
+						assistantError = evt.message.errorMessage;
+					}
 					const assistantText = extractTextFromContent(evt.message.content);
 					appendRecentOutput(progress, assistantText.split("\n").slice(-10));
 					// Final assistant message: start the exit drain window.
 					if (terminalAssistantStop) {
-						if (!evt.message.errorMessage && assistantText.trim()) assistantError = undefined;
+						if (!evt.message.errorMessage && assistantText.trim() && result.terminalCause === undefined) {
+							assistantError = undefined;
+							pendingProviderFailure = undefined;
+						}
 						cleanTerminalAssistantStopReceived ||= !evt.message.errorMessage;
 						applyChildLifecycle(projectChildLifecycle(evt, true));
 					}
@@ -1228,6 +1251,28 @@ async function runSingleAttempt(
 			keys.push(key);
 			activeToolTimeoutKeysByName.set(toolName, keys);
 		};
+		const terminateForRateLimit = (message: string): boolean => {
+			if (processClosed || lifecycleFinished || interruptedByControl || !claimTerminalCause("rate-limit")) return false;
+			assistantError = message;
+			result.error = message;
+			result.finalOutput = message;
+			progress.status = "failed";
+			progress.error = message;
+			progress.durationMs = Date.now() - startTime;
+			clearTimeoutTimers();
+			clearAllToolTimeouts();
+			fireUpdate();
+			if (process.platform !== "win32" && processTreeController) {
+				void processTreeController.terminate();
+			} else {
+				trySignalChild(proc, "SIGTERM");
+				rateLimitHardKillTimer = setTimeout(() => {
+					if (!processClosed && !childExited) trySignalChild(proc, "SIGKILL");
+				}, 3000);
+				rateLimitHardKillTimer.unref?.();
+			}
+			return true;
+		};
 
 		const stderrTail = createBoundedByteTail();
 		const failProtocol = (limit: ProtocolOutputLimit): void => {
@@ -1305,7 +1350,11 @@ async function runSingleAttempt(
 			}
 			const finalCode = forcedDrainAfterFinalSuccess ? 0 : forcedTerminationSignal || signal ? (code ?? 1) : (code ?? 0);
 			if (!result.error && closeError) result.error = closeError;
-			claimTerminalCause(signal ? "process-signal" : finalCode === 0 && !result.error ? "completed" : "process-failure");
+			claimTerminalCause(signal
+				? "process-signal"
+				: pendingProviderFailure?.terminalCause === "provider-error"
+					? "provider-error"
+					: finalCode === 0 && !result.error ? "completed" : "process-failure");
 			finish(finalCode);
 		});
 		proc.on("error", (error) => {

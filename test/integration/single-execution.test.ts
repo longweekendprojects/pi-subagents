@@ -130,6 +130,8 @@ interface RunSyncResult {
 	transcriptError?: string;
 	finalOutput?: string;
 	processSignal?: string | null;
+	terminalCause?: string;
+	reviewCheckpointState?: string;
 	interrupted?: boolean;
 	timedOut?: boolean;
 	turnBudget?: { maxTurns: number; graceTurns: number; outcome: string; turnCount: number; wrapUpRequestedAtTurn?: number; exceededAtTurn?: number };
@@ -4096,6 +4098,59 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.deepEqual(result.modelAttempts?.map((attempt) => attempt.success), [false]);
 	});
 
+	it("terminates foreground rate limits promptly while retaining incomplete checkpoint evidence", async () => {
+		const runId = `foreground-rate-limit-${Date.now().toString(36)}`;
+		const storePath = path.join(tempDir, `${runId}.checkpoint.json`);
+		const artifactsDir = path.join(tempDir, runId, "artifacts");
+		persistReviewCheckpoint({
+			storePath,
+			identity: { runId, agent: "reviewer", childIndex: 0, attempt: 1 },
+			assistantTurn: 1,
+			submission: {
+				kind: "finding",
+				finding: { severity: "blocker", path: "src/provider.ts", line: 7, claim: "The finding survives provider termination.", evidence: "The durable receipt predates the 429 response." },
+			},
+		});
+		const providerMessage = "rate_limit: HTTP 429, retry after 172800 seconds";
+		mockPi.onCall({
+			jsonl: [{
+				type: "message_end",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "provider rejected the request" }],
+					model: "openai/gpt-5-mini",
+					stopReason: "error",
+					errorMessage: providerMessage,
+					usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } },
+				},
+			}],
+			keepAliveAfterFinalMessageMs: 10_000,
+		});
+
+		const startedAt = Date.now();
+		const result = await runSync(tempDir, [makeAgent("reviewer", { model: "openai/gpt-5-mini" })], "reviewer", "Review the provider boundary", {
+			runId,
+			checkpointPolicy: { version: 1 },
+			reviewCheckpointStorePath: storePath,
+			artifactsDir,
+			acceptance: false,
+			timeoutMs: 20_000,
+		});
+		const elapsed = Date.now() - startedAt;
+
+		assert.ok(elapsed < 5_000, `rate limit should bypass the long provider retry, took ${elapsed}ms`);
+		assert.equal(result.terminalCause, "rate-limit");
+		assert.equal(result.error, providerMessage);
+		assert.equal(result.reviewCheckpointState, "incomplete");
+		assert.equal(result.reviewFindings?.length, 1);
+		assert.equal(result.acceptance?.status, "rejected");
+		assert.equal(result.acceptance?.runtimeChecks?.find((check) => check.id === "review-checkpoint")?.status, "failed");
+		const artifact = JSON.parse(fs.readFileSync(result.reviewCheckpointArtifactPath!, "utf-8")) as { status?: string; cause?: string; findings?: Array<{ path?: string }> };
+		assert.equal(artifact.status, "truncated");
+		assert.equal(artifact.cause, "rate-limit");
+		assert.equal(artifact.findings?.[0]?.path, "src/provider.ts");
+	});
+
 	it("treats recovered child tool errors as successful foreground runs", async () => {
 		mockPi.onCall({
 			jsonl: [
@@ -4141,6 +4196,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 
 		assert.equal(result.exitCode, 0);
 		assert.equal(result.error, undefined);
+		assert.equal(result.terminalCause, "completed");
 		assert.equal(result.finalOutput, "Recovered");
 		assert.equal(getFinalOutput(result.messages), "Recovered");
 		assert.equal(result.progress.status, "completed");
@@ -4170,6 +4226,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		});
 
 		assert.equal(result.exitCode, 1);
+		assert.equal(result.terminalCause, "provider-error");
 		assert.match(result.error ?? "", /provider transport failed/);
 		assert.equal(result.finalOutput, "");
 		assert.equal(result.progress.status, "failed");

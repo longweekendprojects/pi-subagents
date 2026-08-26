@@ -40,7 +40,7 @@ const MAX_EVENT_BYTES = 64 * 1024;
 const MAX_STEPS = 12;
 const MAX_CHILDREN = 16;
 const MAX_DEPTH = 3;
-const TERMINAL_CAUSES = new Set(["completed", "explicit-stop", "workflow-deadline", "interrupt", "turn-budget", "tool-timeout", "protocol-failure", "process-signal", "process-failure", "spawn-failure"]);
+const TERMINAL_CAUSES = new Set(["completed", "explicit-stop", "workflow-deadline", "interrupt", "turn-budget", "tool-timeout", "protocol-failure", "rate-limit", "provider-error", "process-signal", "process-failure", "spawn-failure"]);
 const REVIEW_CHECKPOINT_STATES = new Set(["missing", "incomplete", "complete", "truncated"]);
 const MAX_RESIDUAL_RISKS = 16;
 

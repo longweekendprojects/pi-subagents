@@ -9,10 +9,20 @@ import {
 	persistReviewCheckpointGateState,
 	projectCheckpointEvidence,
 	readReviewCheckpointStoreState,
+	validateReviewCheckpointSubmission,
 	salvageReviewCheckpoints,
 } from "../../src/runs/shared/review-checkpoint.ts";
 
 describe("review checkpoints", () => {
+	it("accepts provider terminal causes in truncated checkpoint submissions", () => {
+		for (const cause of ["rate-limit", "provider-error"] as const) {
+			assert.deepEqual(
+				validateReviewCheckpointSubmission({ kind: "final", status: "truncated", cause }).submission,
+				{ kind: "final", status: "truncated", cause },
+			);
+		}
+	});
+
 	it("recovers acknowledged legacy evidence when a newer generated snapshot lacks acknowledgement", () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "review-checkpoint-store-"));
 		try {

@@ -379,6 +379,8 @@ export type TerminalCause =
 	| "turn-budget"
 	| "tool-timeout"
 	| "protocol-failure"
+	| "rate-limit"
+	| "provider-error"
 	| "process-signal"
 	| "process-failure"
 	| "spawn-failure";

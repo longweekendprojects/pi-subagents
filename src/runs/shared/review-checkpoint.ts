@@ -45,6 +45,8 @@ const TRUNCATION_CAUSES = new Set<ReviewCheckpointTruncationCause>([
 	"turn-budget",
 	"tool-timeout",
 	"protocol-failure",
+	"rate-limit",
+	"provider-error",
 	"process-signal",
 	"process-failure",
 	"spawn-failure",
@@ -513,7 +515,8 @@ export function persistReviewCheckpoint(input: {
 	const submission = validateReviewCheckpointSubmission(input.submission).submission;
 	if (!submission) throw new Error("review checkpoint submission is invalid.");
 	const persisted = readPersistedStore(input);
-	if (persisted.current.permanentFinalization) {
+	const hasDurableFinalReceipt = persisted.current.records.some((record) => record.submission.kind === "final");
+	if (hasDurableFinalReceipt) {
 		throw new Error("review checkpoint is already final and cannot accept more submissions.");
 	}
 	const assistantTurn = Math.max(input.assistantTurn, persisted.current.assistantTurn);
@@ -532,8 +535,8 @@ export function persistReviewCheckpoint(input: {
 		records: [...persisted.current.records, record],
 		assistantTurn,
 		checkpointSatisfied: true,
-		// The receipt and latch share this one durable primary snapshot.
-		permanentFinalization: submission.kind === "final",
+		// A proactive finalization latch remains durable while final receipts retry.
+		permanentFinalization: persisted.current.permanentFinalization || submission.kind === "final",
 	};
 	persistStoreTransition({ ...persisted, storePath: input.storePath, next });
 	return record;

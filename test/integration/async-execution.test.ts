@@ -82,7 +82,7 @@ interface AsyncResultPayload {
 	totalTokens?: { input: number; output: number; total: number };
 	totalCost?: { inputTokens: number; outputTokens: number; costUsd: number };
 	usageBudget?: UsageBudgetState;
-	results: Array<{ agent?: string; launchContractDigest?: string; launchResolvedExtensions?: LaunchResolvedExtensions; runtimeAcknowledgedExtensions?: RuntimeAcknowledgedExtensions; output?: string; outputState?: "present" | "absent" | "unknown"; success?: boolean; error?: string; protocolError?: { code?: string; stream?: string; limitBytes?: number; observedBytes?: number }; timedOut?: boolean; stopped?: boolean; terminalCause?: string; turnBudget?: { maxTurns: number; graceTurns: number; outcome: string; turnCount: number; wrapUpRequestedAtTurn?: number; terminationDeferredAtTurn?: number; exceededAtTurn?: number }; turnBudgetExceeded?: boolean; wrapUpRequested?: boolean; model?: string; attemptedModels?: string[]; modelAttempts?: Array<{ success?: boolean; error?: string }>; totalCost?: { inputTokens: number; outputTokens: number; costUsd: number }; structuredOutput?: unknown; agentContract?: { version: 1 }; execution?: { status?: string; success?: boolean; exitCode?: number }; effects?: { fileMutation?: { status?: string; expected?: boolean; attempted?: boolean } }; intercomTarget?: string; acceptance?: { status?: string; effectiveAcceptance?: { level?: string }; childReport?: unknown; runtimeChecks?: Array<{ id?: string; status?: string; message?: string }> }; artifactPaths?: { outputPath?: string; inputPath?: string; metadataPath?: string; transcriptPath?: string }; outputSaveError?: string; metadataSaveError?: string; capabilityCeiling?: { version?: number; allowedTools?: string[]; denyExtensions?: boolean; sources?: string[] }; capabilityAudit?: { effectiveTools?: string[]; removedTools?: string[]; extensionsDenied?: boolean } }>;
+	results: Array<{ agent?: string; launchContractDigest?: string; launchResolvedExtensions?: LaunchResolvedExtensions; runtimeAcknowledgedExtensions?: RuntimeAcknowledgedExtensions; output?: string; outputState?: "present" | "absent" | "unknown"; success?: boolean; error?: string; protocolError?: { code?: string; stream?: string; limitBytes?: number; observedBytes?: number }; timedOut?: boolean; stopped?: boolean; terminalCause?: string; reviewCheckpointState?: string; reviewFindings?: unknown[]; reviewCheckpointArtifactPath?: string; turnBudget?: { maxTurns: number; graceTurns: number; outcome: string; turnCount: number; wrapUpRequestedAtTurn?: number; terminationDeferredAtTurn?: number; exceededAtTurn?: number }; turnBudgetExceeded?: boolean; wrapUpRequested?: boolean; model?: string; attemptedModels?: string[]; modelAttempts?: Array<{ success?: boolean; error?: string }>; totalCost?: { inputTokens: number; outputTokens: number; costUsd: number }; structuredOutput?: unknown; agentContract?: { version: 1 }; execution?: { status?: string; success?: boolean; exitCode?: number }; effects?: { fileMutation?: { status?: string; expected?: boolean; attempted?: boolean } }; intercomTarget?: string; acceptance?: { status?: string; effectiveAcceptance?: { level?: string }; childReport?: unknown; runtimeChecks?: Array<{ id?: string; status?: string; message?: string }> }; artifactPaths?: { outputPath?: string; inputPath?: string; metadataPath?: string; transcriptPath?: string }; outputSaveError?: string; metadataSaveError?: string; capabilityCeiling?: { version?: number; allowedTools?: string[]; denyExtensions?: boolean; sources?: string[] }; capabilityAudit?: { effectiveTools?: string[]; removedTools?: string[]; extensionsDenied?: boolean } }>;
 	outputs?: Record<string, { text?: string; structured?: unknown }>;
 	workflowGraph?: { nodes?: Array<{ kind?: string; label?: string; phase?: string; status?: string; acceptanceStatus?: string; error?: string; outputName?: string; structured?: boolean; children?: Array<{ label?: string; outputName?: string; itemKey?: string; status?: string; acceptanceStatus?: string; error?: string }> }> };
 	parallelHandoff?: { version?: number; path?: string; groupCount?: number; childCount?: number; changedPatches?: number; cleanupState?: string };
@@ -3254,6 +3254,64 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.match(statusPayload.steps?.[0]?.error ?? "", /429 quota exceeded/);
 	});
 
+	it("terminates async rate limits promptly while retaining incomplete checkpoint evidence", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const id = `async-rate-limit-${Date.now().toString(36)}`;
+		persistReviewCheckpoint({
+			storePath: path.join(ASYNC_DIR, id, "review-checkpoints", `${id}-0.json`),
+			identity: { runId: id, agent: "reviewer", childIndex: 0, attempt: 1 },
+			assistantTurn: 1,
+			submission: {
+				kind: "finding",
+				finding: { severity: "blocker", path: "src/provider.ts", line: 7, claim: "The finding survives provider termination.", evidence: "The durable receipt predates the 429 response." },
+			},
+		});
+		const providerMessage = "rate_limit: HTTP 429, retry after 172800 seconds";
+		mockPi.onCall({
+			jsonl: [{
+				type: "message_end",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "provider rejected the request" }],
+					model: "openai/gpt-5-mini",
+					stopReason: "error",
+					errorMessage: providerMessage,
+					usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } },
+				},
+			}],
+			keepAliveAfterFinalMessageMs: 10_000,
+		});
+
+		const startedAt = Date.now();
+		executeAsyncSingle(id, {
+			agent: "reviewer",
+			task: "Review the provider boundary",
+			agentConfig: makeAgent("reviewer", { model: "openai/gpt-5-mini" }),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			sessionRoot: path.join(tempDir, "sessions"),
+			maxSubagentDepth: 2,
+			acceptance: false,
+			checkpointPolicy: { version: 1 },
+		});
+		const payload = JSON.parse(fs.readFileSync(await waitForAsyncResultFile(id, 10_000), "utf-8")) as AsyncResultPayload;
+		const elapsed = Date.now() - startedAt;
+		const result = payload.results[0];
+
+		assert.ok(elapsed < 5_000, `rate limit should bypass the long provider retry, took ${elapsed}ms`);
+		assert.equal(payload.terminalCause, "rate-limit");
+		assert.equal(result?.terminalCause, "rate-limit");
+		assert.equal(result?.error, providerMessage);
+		assert.equal(result?.reviewCheckpointState, "incomplete");
+		assert.equal(result?.reviewFindings?.length, 1);
+		assert.equal(result?.acceptance?.status, "rejected");
+		assert.equal(result?.acceptance?.runtimeChecks?.find((check) => check.id === "review-checkpoint")?.status, "failed");
+		const artifact = JSON.parse(fs.readFileSync(result?.reviewCheckpointArtifactPath!, "utf-8")) as { status?: string; cause?: string; findings?: Array<{ path?: string }> };
+		assert.equal(artifact.status, "truncated");
+		assert.equal(artifact.cause, "rate-limit");
+		assert.equal(artifact.findings?.[0]?.path, "src/provider.ts");
+	});
+
 	it("background runs treat recovered child errors as successful", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		mockPi.onCall({
 			jsonl: [
@@ -3298,6 +3356,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(payload.exitCode, 0);
 		assert.equal(payload.results[0]?.success, true);
 		assert.equal(payload.results[0]?.error, undefined);
+		assert.equal(payload.results[0]?.terminalCause, "completed");
 		assert.equal(payload.results[0]?.output, "Recovered asynchronously");
 		const statusPayload = await waitForAsyncState(id, (candidate) => candidate.state === "complete");
 		assert.equal(statusPayload.state, "complete");
@@ -3347,6 +3406,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(payload.state, "failed");
 		assert.equal(payload.exitCode, 1);
 		assert.equal(payload.results[0]?.success, false);
+		assert.equal(payload.results[0]?.terminalCause, "provider-error");
 		assert.match(payload.results[0]?.error ?? "", /provider transport failed/);
 		assert.equal(payload.results[0]?.output, "");
 		const statusPayload = await waitForAsyncState(id, (candidate) => candidate.state === "failed");
