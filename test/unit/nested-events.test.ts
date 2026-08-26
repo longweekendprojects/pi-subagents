@@ -173,7 +173,22 @@ describe("nested event parsing and projection", () => {
 			ts: 100,
 			parentRunId: "root-run",
 			parentStepIndex: 1,
-			child: { ...child("nested-a", "running", 100), model: "provider/gpt-5.6-luna:medium", thinking: "medium", steps: [{ agent: "leaf", status: "running", model: "provider/leaf", thinking: "low" }], children: [child("nested-grandchild", "running", 100, "nested-a")] },
+			child: {
+				...child("nested-a", "running", 100),
+				model: "provider/gpt-5.6-luna:medium",
+				thinking: "medium",
+				steps: [{
+					agent: "leaf",
+					status: "running",
+					model: "provider/leaf",
+					thinking: "low",
+					checkpointPolicy: { version: 1 },
+					reviewCheckpointState: "incomplete",
+					reviewCheckpointArtifactPath: "/tmp/leaf-checkpoint.final.json",
+					residualRisks: ["leaf risk"],
+				}],
+				children: [child("nested-grandchild", "running", 100, "nested-a")],
+			},
 		});
 		writeNestedEvent(route, {
 			type: "subagent.nested.updated",
@@ -183,6 +198,10 @@ describe("nested event parsing and projection", () => {
 			child: {
 				...child("nested-a", "running", 200),
 				currentTool: "read",
+				checkpointPolicy: { version: 1 },
+				reviewCheckpointState: "truncated",
+				reviewCheckpointArtifactPath: "/tmp/checkpoint.final.json",
+				residualRisks: ["retained risk", "x".repeat(600), ...Array.from({ length: 20 }, (_, index) => `risk-${index}`)],
 				runtimeAcknowledgedExtensions: { version: 1, source: "child-runtime", ids: ["ext.ok", "bad/path", "ext.ok"], omitted: 1 },
 			},
 		});
@@ -210,6 +229,13 @@ describe("nested event parsing and projection", () => {
 			ids: ["ext.ok"],
 			omitted: 1,
 		});
+		assert.equal(registry.children[0]?.reviewCheckpointState, "truncated");
+		assert.equal(registry.children[0]?.reviewCheckpointArtifactPath, "/tmp/checkpoint.final.json");
+		assert.equal(registry.children[0]?.residualRisks?.length, 16);
+		assert.equal(registry.children[0]?.residualRisks?.[1]?.length, 512);
+		assert.equal(registry.children[0]?.steps?.[0]?.reviewCheckpointState, "incomplete");
+		assert.equal(registry.children[0]?.steps?.[0]?.reviewCheckpointArtifactPath, "/tmp/leaf-checkpoint.final.json");
+		assert.deepEqual(registry.children[0]?.steps?.[0]?.residualRisks, ["leaf risk"]);
 
 		const job: AsyncJobState = {
 			asyncId: "root-run",

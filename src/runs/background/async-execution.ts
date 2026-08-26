@@ -288,6 +288,7 @@ export interface AsyncRunnerStepBuildParams {
 	validateOutputBindings?: boolean;
 	toolBudget?: ResolvedToolBudget;
 	checkpointPolicy?: import("../../shared/types.ts").ReviewCheckpointPolicy;
+	turnBudget?: ResolvedTurnBudget;
 	configToolBudget?: ResolvedToolBudget;
 	/** Optional per-call hard toolTimeoutMs override from the subagent invocation. */
 	callToolTimeoutMs?: number;
@@ -722,6 +723,9 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 	};
 	const buildSeqStep = (s: SequentialStep, sessionFile?: string, behaviorCwd?: string, progressPrecreated = false, resolvedBehavior?: ResolvedStepBehavior, flatIndex?: number, parallelOutputNamespace?: { stepIndex: number; taskIndex?: number }, runFanoutPath?: string) => {
 		const a = agents.find((x) => x.name === s.agent)!;
+		const checkpointValidation = s.checkpointPolicy === undefined ? undefined : validateCheckpointPolicy(s.checkpointPolicy, `chain checkpointPolicy for '${s.agent}'`);
+		if (checkpointValidation?.error) throw new AsyncStartValidationError(checkpointValidation.error);
+		const checkpointPolicy = checkpointValidation?.policy ?? params.checkpointPolicy;
 		const externalRunner = a.runner?.type === "external-cli" || a.runner?.type === "external-job";
 		const externalRunnerType = a.runner?.type;
 		if (externalRunner) {
@@ -730,6 +734,7 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 			if (s.outputSchema !== undefined) unsupported.push("structured output");
 			if (s.acceptance !== undefined || params.agentContract !== undefined || s.agentContract !== undefined) unsupported.push("acceptance/agent contract");
 			if (s.toolBudget !== undefined || params.toolBudget !== undefined || a.toolBudget !== undefined || params.configToolBudget !== undefined) unsupported.push("tool budget");
+			if (checkpointPolicy) unsupported.push("review checkpoints");
 			if (params.contextForAgent?.(s.agent) === "fork") unsupported.push("fork context");
 			if (unsupported.length > 0) throw new AsyncStartValidationError(`Agent '${a.name}' uses runner.type='${externalRunnerType}' and does not support: ${unsupported.join(", ")}.`);
 		}
@@ -807,9 +812,6 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 		const effectiveThinking = externalRunner ? undefined : thinkingOverride ?? a.thinking;
 		const model = externalRunner ? undefined : applyThinkingSuffix(primaryModel, effectiveThinking, thinkingOverride !== undefined);
 		const agentContract = s.agentContract ?? params.agentContract;
-		const checkpointValidation = s.checkpointPolicy === undefined ? undefined : validateCheckpointPolicy(s.checkpointPolicy, `chain checkpointPolicy for '${s.agent}'`);
-		if (checkpointValidation?.error) throw new AsyncStartValidationError(checkpointValidation.error);
-		const checkpointPolicy = checkpointValidation?.policy ?? params.checkpointPolicy;
 		const toolPlan = resolvePiLaunchToolPlan({
 			tools: a.tools,
 			extensions: a.extensions,
@@ -824,6 +826,31 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 			agentName: a.name,
 		});
 		const launchResolvedExtensions = externalRunner ? undefined : projectLaunchResolvedChildExtensions(toolPlan);
+		const modelCandidates = externalRunner ? undefined : buildModelCandidates(primaryModel, a.fallbackModels, availableModels, ctx.currentModelProvider, { scope: ctx.modelScope }).flatMap((candidate) => {
+			const resolved = applyThinkingSuffix(candidate, effectiveThinking, thinkingOverride !== undefined);
+			return resolved ? [resolved] : [];
+		});
+		const definitionDigest = agentDefinitionDigest(a);
+		const launchBindingTask = parallelOutputNamespace && parallelOutputNamespace.taskIndex === undefined ? undefined : task;
+		const launchContractDigest = externalRunner ? undefined : launchBindingDigest({
+			definitionDigest,
+			task,
+			...(model ? { model } : {}),
+			modelCandidates,
+			...(resolveEffectiveThinking(model, effectiveThinking) ? { thinking: resolveEffectiveThinking(model, effectiveThinking) } : {}),
+			systemPrompt: appendTurnBudgetSystemPrompt(systemPrompt, params.turnBudget),
+			systemPromptMode: a.systemPromptMode,
+			inheritProjectContext: a.inheritProjectContext,
+			inheritSkills: a.inheritSkills,
+			skills: resolvedSkills.map((r) => r.name),
+			tools: toolPlan.effectiveToolAllowlist,
+			extensions: toolPlan.extensionArgs,
+			mcpDirectTools: toolPlan.effectiveMcpTools,
+			...(outputPath ? { outputPath } : {}),
+			outputMode: behavior.outputMode,
+			...(checkpointPolicy ? { checkpointPolicy } : {}),
+			...(s.outputSchema ? { structuredOutputSchema: s.outputSchema } : {}),
+		});
 		const permissionRules = resolvePermissionRules(ctx.permissions, a.permissions);
 		if (externalRunner && permissionRules) {
 			throw new AsyncStartValidationError(`Agent '${a.name}' uses runner.type='${externalRunnerType}', which cannot enforce native Pi child permission rules.`);
@@ -846,9 +873,8 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 			model,
 			thinking: resolveEffectiveThinking(model, effectiveThinking),
 			launchResolvedExtensions,
-			modelCandidates: externalRunner ? undefined : buildModelCandidates(primaryModel, a.fallbackModels, availableModels, ctx.currentModelProvider, { scope: ctx.modelScope }).map((candidate) =>
-				applyThinkingSuffix(candidate, effectiveThinking, thinkingOverride !== undefined),
-			),
+			...(externalRunner ? {} : { definitionDigest, ...(launchBindingTask ? { launchBindingTask } : {}), launchContractDigest }),
+			modelCandidates,
 			tools: a.tools,
 			extensions: a.extensions,
 			subagentOnlyExtensions: a.subagentOnlyExtensions,
@@ -1099,6 +1125,7 @@ export function executeAsyncChain(
 		asyncDir,
 		toolBudget: params.toolBudget,
 		checkpointPolicy,
+		turnBudget: params.turnBudget,
 		configToolBudget: params.configToolBudget,
 		callToolTimeoutMs: params.callToolTimeoutMs,
 		configToolTimeoutMs: params.configToolTimeoutMs,

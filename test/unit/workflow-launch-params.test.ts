@@ -21,28 +21,39 @@ describe("workflow launch params", () => {
 		);
 	});
 
-	it("clamps explicit, defaulted, agent-defaulted, and retained children before launch", () => {
+	it("reserves collection time only for checkpoint-enabled workflow children", () => {
 		const parentDeadlineAt = Date.now() + 180_000;
-		const prepare = (child: Record<string, unknown>, key: string) => prepareWorkflowLaunchParams({}, child, "workflow-run", key, { parentDeadlineAt });
+		const checkpointDefaults = { checkpointPolicy: { version: 1 as const } };
+		const prepareCheckpoint = (child: Record<string, unknown>, key: string) => prepareWorkflowLaunchParams(checkpointDefaults, child, "workflow-run", key, { parentDeadlineAt });
 		const agentDefault = applySingleAgentLaunchDefaults(
-			prepare({ agent: "worker", task: "Run" }, "agent-default"),
+			prepareCheckpoint({ agent: "worker", task: "Run" }, "agent-default"),
 			[{ name: "worker", defaultTimeoutMs: 500_000 }] as never,
 		);
-		const cases = [
-			{ name: "explicit timeout", params: prepare({ agent: "worker", task: "Run", timeoutMs: 500_000 }, "timeout") },
-			{ name: "explicit alias", params: prepare({ agent: "worker", task: "Run", maxRuntimeMs: 500_000 }, "alias") },
-			{ name: "workflow default", params: prepare({ agent: "worker", task: "Run" }, "default") },
+		const checkpointCases = [
+			{ name: "explicit timeout", params: prepareCheckpoint({ agent: "worker", task: "Run", timeoutMs: 500_000 }, "timeout") },
+			{ name: "explicit alias", params: prepareCheckpoint({ agent: "worker", task: "Run", maxRuntimeMs: 500_000 }, "alias") },
+			{ name: "workflow default", params: prepareCheckpoint({ agent: "worker", task: "Run" }, "default") },
 			{ name: "agent default", params: agentDefault.params },
-			{ name: "retained", params: prepare({ resume: "retained-run", task: "Continue" }, "retained") },
 		];
-		for (const testCase of cases) {
+		for (const testCase of checkpointCases) {
 			assert.ok((testCase.params?.timeoutMs ?? 0) > 0, testCase.name);
 			assert.ok((testCase.params?.timeoutMs ?? Number.MAX_SAFE_INTEGER) <= 120_000, testCase.name);
 			assert.equal(testCase.params?.workflowParentDeadlineAt, parentDeadlineAt, testCase.name);
+			assert.deepEqual(testCase.params?.checkpointPolicy, {
+				version: 1,
+				requiredByTurn: 3,
+				reserveTurns: 1,
+				finalizeReserveMs: 120000,
+				collectionReserveMs: 60000,
+			}, testCase.name);
 		}
 		assert.equal(agentDefault.error, undefined);
+
+		const checkpointFree = prepareWorkflowLaunchParams({}, { agent: "worker", task: "Run", timeoutMs: 500_000 }, "workflow-run", "free", { parentDeadlineAt });
+		assert.ok((checkpointFree.timeoutMs ?? 0) > 120_000, "checkpoint-free child keeps the parent deadline available");
+		assert.doesNotThrow(() => prepareWorkflowLaunchParams({}, { agent: "worker", task: "Run" }, "workflow-run", "short-free", { parentDeadlineAt: Date.now() + 60_000 }));
 		assert.throws(
-			() => prepareWorkflowLaunchParams({}, { agent: "worker", task: "Run" }, "workflow-run", "expired", { parentDeadlineAt: Date.now() + 60_000 }),
+			() => prepareWorkflowLaunchParams(checkpointDefaults, { agent: "worker", task: "Run" }, "workflow-run", "expired", { parentDeadlineAt: Date.now() + 60_000 }),
 			/no positive child interval after the 60000ms collection reserve/,
 		);
 	});

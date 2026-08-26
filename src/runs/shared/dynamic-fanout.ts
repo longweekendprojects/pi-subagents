@@ -52,6 +52,7 @@ const RUNNER_DYNAMIC_PARALLEL_KEYS = new Set([
 	"outputName", "structured", "inheritProjectContext", "inheritSkills", "skills", "outputPath", "namespaceOutputPath", "maxSubagentDepth", "timeoutMs", "waitToolEnabled",
 	"structuredOutput", "structuredOutputSchema", "tools", "extensions", "subagentOnlyExtensions", "mcpDirectTools", "capabilityCeiling", "completionGuard", "systemPrompt",
 	"systemPromptMode", "thinking", "modelCandidates", "sessionFile", "effectiveAcceptance", "acceptanceInput", "acceptanceRole", "parentSessionId", "launchResolvedExtensions",
+	"permissionRules", "runFanoutPath", "toolTimeoutMs", "definitionDigest", "launchBindingTask", "launchContractDigest", "runner", "context", "checkpointPolicy",
 ]);
 const DYNAMIC_COLLECT_KEYS = new Set(["as", "outputSchema"]);
 

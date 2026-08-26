@@ -41,6 +41,8 @@ const MAX_STEPS = 12;
 const MAX_CHILDREN = 16;
 const MAX_DEPTH = 3;
 const TERMINAL_CAUSES = new Set(["completed", "explicit-stop", "workflow-deadline", "interrupt", "turn-budget", "tool-timeout", "protocol-failure", "process-signal", "process-failure", "spawn-failure"]);
+const REVIEW_CHECKPOINT_STATES = new Set(["missing", "incomplete", "complete", "truncated"]);
+const MAX_RESIDUAL_RISKS = 16;
 
 function sanitizeTerminalCause(value: unknown): import("../../shared/types.ts").TerminalCause | undefined {
 	return typeof value === "string" && TERMINAL_CAUSES.has(value)
@@ -54,6 +56,23 @@ function sanitizeCheckpoints(value: unknown): import("../../shared/types.ts").Re
 		const valid = validateReviewCheckpointRecord(record);
 		return valid ? [valid] : [];
 	});
+}
+
+function sanitizeReviewCheckpointState(value: unknown, records: import("../../shared/types.ts").ReviewCheckpointRecord[]): import("../../shared/types.ts").ReviewCheckpointEvidenceState | undefined {
+	const derived = projectCheckpointEvidence(records).state;
+	if (records.length > 0) return derived;
+	return typeof value === "string" && REVIEW_CHECKPOINT_STATES.has(value)
+		? value as import("../../shared/types.ts").ReviewCheckpointEvidenceState
+		: derived;
+}
+
+function sanitizeResidualRisks(value: unknown): string[] | undefined {
+	if (!Array.isArray(value)) return undefined;
+	const risks = value
+		.filter((risk): risk is string => typeof risk === "string" && risk.trim().length > 0)
+		.map((risk) => risk.trim().slice(0, 512))
+		.slice(0, MAX_RESIDUAL_RISKS);
+	return risks.length > 0 ? risks : undefined;
 }
 
 type NestedStatusEventType = "subagent.nested.started" | "subagent.nested.updated" | "subagent.nested.completed";
@@ -318,6 +337,9 @@ function sanitizeStep(input: unknown, depth: number): NestedStepSummary | undefi
 	const checkpointPolicy = raw.checkpointPolicy === undefined ? undefined : validateCheckpointPolicy(raw.checkpointPolicy).policy;
 	const reviewCheckpoints = checkpointPolicy ? sanitizeCheckpoints(raw.reviewCheckpoints) : [];
 	const checkpointEvidence = projectCheckpointEvidence(reviewCheckpoints);
+	const reviewCheckpointState = checkpointPolicy ? sanitizeReviewCheckpointState(raw.reviewCheckpointState, reviewCheckpoints) : undefined;
+	const reviewCheckpointArtifactPath = checkpointPolicy ? stringValue(raw.reviewCheckpointArtifactPath, 2048) : undefined;
+	const residualRisks = sanitizeResidualRisks(raw.residualRisks);
 	return {
 		agent,
 		status,
@@ -339,7 +361,10 @@ function sanitizeStep(input: unknown, depth: number): NestedStepSummary | undefi
 		...(sanitizeTerminalCause(raw.terminalCause) ? { terminalCause: sanitizeTerminalCause(raw.terminalCause) } : {}),
 		...(checkpointPolicy ? { checkpointPolicy } : {}),
 		...(reviewCheckpoints.length ? { reviewCheckpoints } : {}),
+		...(reviewCheckpointState ? { reviewCheckpointState } : {}),
 		...(reviewCheckpoints.length ? { reviewFindings: checkpointEvidence.findings } : {}),
+		...(reviewCheckpointArtifactPath ? { reviewCheckpointArtifactPath } : {}),
+		...(residualRisks ? { residualRisks } : {}),
 		...(sanitizeTurnBudget(raw.turnBudget) ? { turnBudget: sanitizeTurnBudget(raw.turnBudget) } : {}),
 		...(raw.turnBudgetExceeded === true ? { turnBudgetExceeded: true } : {}),
 		...(raw.wrapUpRequested === true ? { wrapUpRequested: true } : {}),
@@ -362,6 +387,9 @@ export function sanitizeSummary(input: unknown, depth = 0): NestedRunSummary | u
 	const checkpointPolicy = raw.checkpointPolicy === undefined ? undefined : validateCheckpointPolicy(raw.checkpointPolicy).policy;
 	const reviewCheckpoints = checkpointPolicy ? sanitizeCheckpoints(raw.reviewCheckpoints) : [];
 	const checkpointEvidence = projectCheckpointEvidence(reviewCheckpoints);
+	const reviewCheckpointState = checkpointPolicy ? sanitizeReviewCheckpointState(raw.reviewCheckpointState, reviewCheckpoints) : undefined;
+	const reviewCheckpointArtifactPath = checkpointPolicy ? stringValue(raw.reviewCheckpointArtifactPath, 2048) : undefined;
+	const residualRisks = sanitizeResidualRisks(raw.residualRisks);
 	return {
 		id: raw.id,
 		parentRunId: raw.parentRunId,
@@ -406,7 +434,10 @@ export function sanitizeSummary(input: unknown, depth = 0): NestedRunSummary | u
 		...(sanitizeTerminalCause(raw.terminalCause) ? { terminalCause: sanitizeTerminalCause(raw.terminalCause) } : {}),
 		...(checkpointPolicy ? { checkpointPolicy } : {}),
 		...(reviewCheckpoints.length ? { reviewCheckpoints } : {}),
+		...(reviewCheckpointState ? { reviewCheckpointState } : {}),
 		...(reviewCheckpoints.length ? { reviewFindings: checkpointEvidence.findings } : {}),
+		...(reviewCheckpointArtifactPath ? { reviewCheckpointArtifactPath } : {}),
+		...(residualRisks ? { residualRisks } : {}),
 		...(sanitizeTurnBudget(raw.turnBudget) ? { turnBudget: sanitizeTurnBudget(raw.turnBudget) } : {}),
 		...(raw.turnBudgetExceeded === true ? { turnBudgetExceeded: true } : {}),
 		...(raw.wrapUpRequested === true ? { wrapUpRequested: true } : {}),

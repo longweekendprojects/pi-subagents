@@ -6,7 +6,9 @@ import { describe, it } from "node:test";
 import {
 	REVIEW_CHECKPOINT_TOOL_NAME,
 	persistReviewCheckpoint,
+	persistReviewCheckpointGateState,
 	projectCheckpointEvidence,
+	readReviewCheckpointStoreState,
 	salvageReviewCheckpoints,
 } from "../../src/runs/shared/review-checkpoint.ts";
 
@@ -58,6 +60,40 @@ describe("review checkpoints", () => {
 			assert.equal(evidence.findings.length, 1);
 			assert.deepEqual(evidence.findings[0]?.line, { start: 12, end: 14 });
 			assert.equal(JSON.stringify(evidence.findings).includes("prose must never"), false);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("persists the logical turn and finalization latch with the acknowledged final receipt", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "review-checkpoint-gate-state-"));
+		try {
+			const storePath = path.join(dir, "checkpoint.json");
+			const identity = { runId: "run-state", agent: "reviewer", childIndex: 0 };
+			persistReviewCheckpointGateState({ storePath, identity, assistantTurn: 3 });
+			assert.deepEqual(readReviewCheckpointStoreState(storePath, identity), {
+				records: [],
+				assistantTurn: 3,
+				checkpointSatisfied: false,
+				permanentFinalization: false,
+			});
+			persistReviewCheckpoint({
+				storePath,
+				identity,
+				assistantTurn: 3,
+				submission: { kind: "final", status: "complete" },
+			});
+			const recovered = readReviewCheckpointStoreState(storePath, identity);
+			assert.equal(recovered.assistantTurn, 3);
+			assert.equal(recovered.checkpointSatisfied, true);
+			assert.equal(recovered.permanentFinalization, true);
+			assert.equal(recovered.records.at(-1)?.submission.kind, "final");
+			assert.throws(() => persistReviewCheckpoint({
+				storePath,
+				identity,
+				assistantTurn: 4,
+				submission: { kind: "progress", status: "no-confirmed-finding-yet" },
+			}), /already final/);
 		} finally {
 			fs.rmSync(dir, { recursive: true, force: true });
 		}

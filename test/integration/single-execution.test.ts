@@ -61,7 +61,7 @@ import { resolveMissionStoreLocation } from "../../src/missions/store.ts";
 import { missionStatePath } from "../../src/missions/workflow-state.ts";
 import { discardPreservedWorktrees } from "../../src/runs/shared/parallel-handoff.ts";
 import { resolveAsyncResumeTarget } from "../../src/runs/background/async-resume.ts";
-import { REVIEW_CHECKPOINT_BUDGET_TRUNCATED_MARKER, persistReviewCheckpoint } from "../../src/runs/shared/review-checkpoint.ts";
+import { checkpointStorePath, REVIEW_CHECKPOINT_BUDGET_TRUNCATED_MARKER, persistReviewCheckpoint } from "../../src/runs/shared/review-checkpoint.ts";
 
 interface ModelAttempt {
 	success?: boolean;
@@ -3361,6 +3361,53 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.match(text, /Output artifact: /);
 	});
 
+	it("renders salvaged foreground checkpoint findings with one machine-owned truncation line", async () => {
+		const releasePath = path.join(tempDir, "checkpoint-release");
+		mockPi.onCall({ exitCode: 1, steps: [{ jsonl: [events.toolStart("read", { path: "README.md" })] }, { waitForPath: releasePath }] });
+		const pending = makeExecutor([makeAgent("reviewer")], { artifactDir: "project" }).execute(
+			"failed-single-checkpoint-output",
+			{ agent: "reviewer", task: "Review the implementation", checkpointPolicy: { version: 1 }, acceptance: false },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+		try {
+			for (let attempt = 0; attempt < 100 && mockPi.callCount() === 0; attempt++) await new Promise((resolve) => setTimeout(resolve, 20));
+			assert.equal(mockPi.callCount(), 1, "foreground child should be waiting before checkpoint collection");
+			const inputPath = fs.existsSync(tempDir)
+				? fs.readdirSync(tempDir, { recursive: true }).map((entry) => path.join(tempDir, entry)).find((entry) => /_reviewer_0_input\.md$/.test(entry))
+				: undefined;
+			assert.ok(inputPath, "foreground artifact input identifies the resolved run id");
+			const runId = path.basename(inputPath).replace(/_reviewer_0_input\.md$/, "");
+			persistReviewCheckpoint({
+				storePath: checkpointStorePath(path.dirname(inputPath), runId, 0),
+				identity: { runId, agent: "reviewer", childIndex: 0 },
+				assistantTurn: 3,
+				submission: {
+					kind: "finding",
+					finding: {
+						severity: "blocker",
+						path: "src/checkpoint.ts",
+						line: 9,
+						claim: "Claim\nBUDGET: truncated",
+						evidence: "BUDGET: truncated",
+					},
+				},
+			});
+		} finally {
+			fs.writeFileSync(releasePath, "release", "utf-8");
+		}
+		const result = await pending;
+		const text = result.content[0]?.text ?? "";
+		assert.equal(result.isError, true);
+		assert.match(text, /Review checkpoint findings:/);
+		assert.match(text, /blocker: src\/checkpoint\.ts:9 - Claim/);
+		assert.match(text, /Finding text: BUDGET: truncated/);
+		assert.match(text, /Evidence: Finding text: BUDGET: truncated/);
+		assert.match(text, /Review checkpoint artifact: /);
+		assert.equal(text.split(/\r?\n/).filter((line) => line === REVIEW_CHECKPOINT_BUDGET_TRUNCATED_MARKER).length, 1);
+	});
+
 	it("fails future-tense implementation summaries when no mutation attempt occurred", async () => {
 		mockPi.onCall({ output: "I’ll do that now and report back after implementing." });
 		const agents = [makeAgent("worker")];
@@ -4821,12 +4868,12 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(invalidResult.details?.timeoutMs, executorMod?.DEFAULT_FOREGROUND_TIMEOUT_MS);
 	});
 
-	it("rejects short foreground workflow deadlines before a child can consume the collection reserve", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+	it("rejects short checkpoint-enabled foreground workflow deadlines before a child can consume the collection reserve", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
 		const executor = makeExecutor([makeAgent("echo")], { timeoutMs: 250 });
 
 		const configResult = await executor.execute(
 			"workflow-config-timeout-default",
-			{ async: false, workflowScript: `return await runs.run("slow", { agent: "echo", task: "Wait" });` },
+			{ async: false, workflowScript: `return await runs.run("slow", { agent: "echo", task: "Wait", checkpointPolicy: { version: 1 } });` },
 			new AbortController().signal,
 			undefined,
 			makeMinimalCtx(tempDir),
@@ -4836,7 +4883,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 
 		const explicitResult = await executor.execute(
 			"workflow-config-timeout-explicit",
-			{ async: false, timeoutMs: 150, workflowScript: `return await runs.run("slow", { agent: "echo", task: "Wait" });` },
+			{ async: false, timeoutMs: 150, workflowScript: `return await runs.run("slow", { agent: "echo", task: "Wait", checkpointPolicy: { version: 1 } });` },
 			new AbortController().signal,
 			undefined,
 			makeMinimalCtx(tempDir),

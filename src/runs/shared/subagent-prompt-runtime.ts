@@ -16,6 +16,8 @@ import {
 	REVIEW_CHECKPOINT_STORE_ENV,
 	REVIEW_CHECKPOINT_TOOL_NAME,
 	persistReviewCheckpoint,
+	persistReviewCheckpointGateState,
+	readReviewCheckpointStoreState,
 	validateCheckpointPolicy,
 	validateReviewCheckpointSubmission,
 } from "./review-checkpoint.ts";
@@ -344,26 +346,47 @@ function registerReviewCheckpoint(pi: ExtensionAPI): void {
 	if (!policy || !storePath || !runId || !agent || !Number.isInteger(childIndex) || childIndex < 0) {
 		throw new Error("Invalid review checkpoint runtime configuration.");
 	}
-	let assistantTurn = 0;
-	let checkpointCompleted = false;
-	let permanentFinalization = false;
+	const identity = { runId, agent, childIndex };
+	const recovered = readReviewCheckpointStoreState(storePath, identity);
+	let assistantTurn = recovered.assistantTurn;
+	let checkpointCompleted = recovered.checkpointSatisfied;
+	let permanentFinalization = recovered.permanentFinalization;
+	let gateStateError: string | undefined;
 	const structuredOutputActive = Boolean(process.env[STRUCTURED_OUTPUT_CAPTURE_ENV]);
 	const onRuntimeEvent = pi.on as unknown as (event: string, handler: (event: { toolName?: unknown }) => unknown) => void;
-	const beginFinalizationIfDue = (): boolean => {
-		if (permanentFinalization) return true;
-		if (assistantTurn >= policy.requiredByTurn + policy.reserveTurns || (finalizeAt !== undefined && Date.now() >= finalizeAt)) {
-			permanentFinalization = true;
+	const finalizationIsDue = (): boolean => assistantTurn >= policy.requiredByTurn + policy.reserveTurns
+		|| (finalizeAt !== undefined && Date.now() >= finalizeAt);
+	const persistGateState = (nextPermanentFinalization = permanentFinalization): boolean => {
+		try {
+			const state = persistReviewCheckpointGateState({
+				storePath,
+				identity,
+				assistantTurn,
+				checkpointSatisfied: checkpointCompleted,
+				permanentFinalization: nextPermanentFinalization,
+			});
+			assistantTurn = state.assistantTurn;
+			checkpointCompleted = state.checkpointSatisfied;
+			permanentFinalization = state.permanentFinalization;
+			gateStateError = undefined;
+			return true;
+		} catch (error) {
+			gateStateError = `Review checkpoint gate state persistence failed: ${error instanceof Error ? error.message : String(error)}`;
+			return false;
 		}
-		return permanentFinalization;
 	};
+	const beginFinalizationIfDue = (): boolean => permanentFinalization || finalizationIsDue();
 	const allowsFinalizationTool = (toolName: string): boolean => toolName === REVIEW_CHECKPOINT_TOOL_NAME || (toolName === "structured_output" && structuredOutputActive);
 	onRuntimeEvent("turn_start", () => {
 		assistantTurn += 1;
-		beginFinalizationIfDue();
+		persistGateState();
 		return undefined;
 	});
 	onRuntimeEvent("tool_call", (event) => {
 		const toolName = typeof event.toolName === "string" ? event.toolName : "tool";
+		if (gateStateError && !allowsFinalizationTool(toolName)) {
+			return { block: true, reason: `${gateStateError} Only finalization tools may retry durable recovery.` };
+		}
 		if (beginFinalizationIfDue()) {
 			return allowsFinalizationTool(toolName)
 				? undefined
@@ -372,6 +395,7 @@ function registerReviewCheckpoint(pi: ExtensionAPI): void {
 					reason: `Review checkpoint finalization is permanent at assistant turn ${assistantTurn}. Only '${REVIEW_CHECKPOINT_TOOL_NAME}'${structuredOutputActive ? " and 'structured_output'" : ""} may run.`,
 				};
 		}
+		if (gateStateError) return allowsFinalizationTool(toolName) ? undefined : { block: true, reason: `${gateStateError} Only finalization tools may retry durable recovery.` };
 		if (assistantTurn < policy.requiredByTurn || checkpointCompleted) return undefined;
 		return allowsFinalizationTool(toolName)
 			? undefined
@@ -402,7 +426,7 @@ function registerReviewCheckpoint(pi: ExtensionAPI): void {
 			try {
 				record = persistReviewCheckpoint({
 					storePath,
-					identity: { runId, agent, childIndex },
+					identity,
 					assistantTurn: Math.max(1, assistantTurn),
 					submission: submission.submission,
 				});
@@ -410,6 +434,10 @@ function registerReviewCheckpoint(pi: ExtensionAPI): void {
 				throw new Error(`Review checkpoint persistence failed: ${error instanceof Error ? error.message : String(error)}`);
 			}
 			checkpointCompleted = true;
+			gateStateError = undefined;
+			// A final receipt carries the latch in the same durable primary snapshot,
+			// so no subsequent investigation tool can race its acknowledgement.
+			if (submission.submission.kind === "final") permanentFinalization = true;
 			return {
 				content: [{ type: "text", text: "Review checkpoint persisted." }],
 				details: { reviewCheckpoint: record },

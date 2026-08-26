@@ -33,6 +33,7 @@ import {
 	type ResolvedAcceptanceConfig,
 	truncateOutput,
 	getSubagentDepthEnv,
+	type TerminalCause,
 } from "../../shared/types.ts";
 import {
 	DEFAULT_CONTROL_CONFIG,
@@ -443,6 +444,11 @@ async function runSingleAttempt(
 		...(options.capabilityCeiling ? { capabilityCeiling: options.capabilityCeiling } : {}),
 		...(capabilityAudit ? { capabilityAudit } : {}),
 	}, options.context);
+	const claimTerminalCause = (cause: TerminalCause): boolean => {
+		if (result.terminalCause !== undefined) return false;
+		result.terminalCause = cause;
+		return true;
+	};
 	const startTime = Date.now();
 	if (options.structuredOutput) {
 		try {
@@ -487,7 +493,7 @@ async function runSingleAttempt(
 		cleanupTempDir(tempDir);
 		result.exitCode = 1;
 		result.timedOut = true;
-		result.terminalCause = "workflow-deadline";
+		claimTerminalCause("workflow-deadline");
 		result.error = attemptTimeout.message;
 		result.finalOutput = attemptTimeout.message;
 		progress.status = "failed";
@@ -843,9 +849,9 @@ async function runSingleAttempt(
 		const requestTurnBudgetAbort = (turnCount: number) => {
 			const budget = options.turnBudget;
 			if (!budget || result.timedOut || result.turnBudgetExceeded || interruptedByControl || processClosed || lifecycleFinished) return;
+			if (!claimTerminalCause("turn-budget")) return;
 			const message = turnBudgetExceededMessage(budget, turnCount);
 			result.turnBudgetExceeded = true;
-			result.terminalCause = "turn-budget";
 			result.wrapUpRequested = true;
 			result.turnBudget = turnBudgetState(budget, turnCount, true);
 			result.error = message;
@@ -1123,9 +1129,8 @@ async function runSingleAttempt(
 
 		if (attemptTimeout) {
 			timeoutTimer = setTimeout(() => {
-				if (processClosed || lifecycleFinished || interruptedByControl) return;
+				if (processClosed || lifecycleFinished || interruptedByControl || !claimTerminalCause("workflow-deadline")) return;
 				result.timedOut = true;
-				result.terminalCause = "workflow-deadline";
 				clearAllToolTimeouts();
 				result.error = attemptTimeout.message;
 				result.finalOutput = attemptTimeout.message;
@@ -1184,9 +1189,8 @@ async function runSingleAttempt(
 			}
 		};
 		const terminateForToolTimeout = (message: string): void => {
-			if (processClosed || lifecycleFinished || interruptedByControl) return;
+			if (processClosed || lifecycleFinished || interruptedByControl || !claimTerminalCause("tool-timeout")) return;
 			result.timedOut = true;
-			result.terminalCause = "tool-timeout";
 			result.error = message;
 			result.finalOutput = message;
 			progress.status = "failed";
@@ -1226,9 +1230,8 @@ async function runSingleAttempt(
 
 		const stderrTail = createBoundedByteTail();
 		const failProtocol = (limit: ProtocolOutputLimit): void => {
-			if (result.protocolError) return;
+			if (result.protocolError || !claimTerminalCause("protocol-failure")) return;
 			result.protocolError = limit;
-			result.terminalCause = "protocol-failure";
 			result.error = formatProtocolOutputLimit(limit);
 			progress.status = "failed";
 			progress.error = result.error;
@@ -1301,14 +1304,12 @@ async function runSingleAttempt(
 			}
 			const finalCode = forcedDrainAfterFinalSuccess ? 0 : forcedTerminationSignal || signal ? (code ?? 1) : (code ?? 0);
 			if (!result.error && closeError) result.error = closeError;
-			if (!result.terminalCause) {
-				result.terminalCause = signal ? "process-signal" : finalCode === 0 && !result.error ? "completed" : "process-failure";
-			}
+			claimTerminalCause(signal ? "process-signal" : finalCode === 0 && !result.error ? "completed" : "process-failure");
 			finish(finalCode);
 		});
 		proc.on("error", (error) => {
 			if (lifecycleFinished) return;
-			result.terminalCause = "spawn-failure";
+			claimTerminalCause("spawn-failure");
 			processClosed = true;
 			clearFinalDrainTimers();
 			clearStdioGuard();
@@ -1326,8 +1327,7 @@ async function runSingleAttempt(
 
 		if (options.signal) {
 			const kill = () => {
-				if (processClosed || lifecycleFinished) return;
-				result.terminalCause = "explicit-stop";
+				if (processClosed || lifecycleFinished || !claimTerminalCause("explicit-stop")) return;
 				proc.kill("SIGTERM");
 				abortHardKillTimer = setTimeout(() => {
 					if (!processClosed && !childExited) trySignalChild(proc, "SIGKILL");
@@ -1343,10 +1343,8 @@ async function runSingleAttempt(
 
 		if (options.interruptSignal) {
 			const interrupt = () => {
-				if (processClosed || lifecycleFinished) return;
-				if (result.timedOut) return;
+				if (processClosed || lifecycleFinished || result.timedOut || !claimTerminalCause("interrupt")) return;
 				interruptedByControl = true;
-				result.terminalCause = "interrupt";
 				clearTimeoutTimers();
 				clearAllToolTimeouts();
 				progress.status = "running";
@@ -1379,7 +1377,7 @@ async function runSingleAttempt(
 		}
 	});
 	result.exitCode = exitCode;
-	if (!result.terminalCause && result.exitCode === 0 && !result.error) result.terminalCause = "completed";
+	if (result.exitCode === 0 && !result.error) claimTerminalCause("completed");
 	if (interruptedByControl) {
 		result.exitCode = 0;
 		result.interrupted = true;

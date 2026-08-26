@@ -150,6 +150,13 @@ export interface ReviewCheckpointRecord {
 	submission: ReviewCheckpointSubmission;
 }
 
+/** Durable gate state shared by retries, replacement processes, and model fallbacks. */
+export interface ReviewCheckpointGateState {
+	assistantTurn: number;
+	checkpointSatisfied: boolean;
+	permanentFinalization: boolean;
+}
+
 export type ReviewCheckpointEvidenceState = "missing" | "incomplete" | "complete" | "truncated";
 
 /** Recovery projection produced only from validated durable receipts. */

@@ -245,12 +245,25 @@ describe("subagent prompt runtime", () => {
 			fs.mkdirSync(blockedParent);
 			await checkpointTool.execute("progress", { value: { kind: "progress", status: "no-confirmed-finding-yet" } });
 			assert.equal(await blocked("bash"), false, "a durable halfway checkpoint reopens investigation");
-			for (const handler of handlers.get("turn_start") ?? []) handler({});
-			assert.equal(await blocked("bash"), true, "turn finalization never reopens investigation tools");
-			assert.equal(await blocked(REVIEW_CHECKPOINT_TOOL_NAME), false, "review checkpoint stays retryable during finalization");
-			assert.equal(await blocked("structured_output"), false, "structured output stays retryable during finalization");
 			await checkpointTool.execute("final", { value: { kind: "final", status: "complete" } });
+			assert.equal(await blocked("bash"), true, "a final receipt on turn three immediately closes investigation");
 			assert.equal(await blocked("mcp_remote"), true, "successful checkpoints do not reopen finalization tools");
+
+			const replacementHandlers = new Map<string, Array<(event: { toolName?: string }) => unknown>>();
+			let replacementCheckpointTool: { execute: (_id: string, params: { value: unknown }) => Promise<unknown> } | undefined;
+			registerSubagentPromptRuntime({
+				on(event: string, handler: (event: { toolName?: string }) => unknown) {
+					replacementHandlers.set(event, [...(replacementHandlers.get(event) ?? []), handler]);
+				},
+				registerTool(tool: { name: string; execute: (_id: string, params: { value: unknown }) => Promise<unknown> }) {
+					if (tool.name === REVIEW_CHECKPOINT_TOOL_NAME) replacementCheckpointTool = tool;
+				},
+			} as never);
+			for (const handler of replacementHandlers.get("turn_start") ?? []) handler({});
+			const replacementBlocked = async (toolName: string) => (await Promise.all((replacementHandlers.get("tool_call") ?? []).map((handler) => handler({ toolName })))).some((decision) => (decision as { block?: boolean } | undefined)?.block === true);
+			assert.equal(await replacementBlocked("read"), true, "a replacement cannot reopen a recovered final checkpoint");
+			assert.equal(await replacementBlocked(REVIEW_CHECKPOINT_TOOL_NAME), false, "only finalization tools remain eligible after recovery");
+			assert.ok(replacementCheckpointTool, "replacement runtime keeps the finalization tool available");
 		} finally {
 			fs.rmSync(dir, { recursive: true, force: true });
 		}

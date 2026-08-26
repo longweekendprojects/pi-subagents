@@ -10,6 +10,11 @@ class FakeFs {
 	failMkdirCodes: string[] = [];
 	failRenameCodes: string[] = [];
 	writeOptions = new Map<string, unknown>();
+	events: string[] = [];
+	nextDescriptor = 1;
+	descriptorPaths = new Map<number, string>();
+	failFsyncAt: number | undefined;
+	fsyncCalls = 0;
 	failCleanup = false;
 
 	mkdirSync(dirPath: string): void {
@@ -23,11 +28,13 @@ class FakeFs {
 	}
 
 	writeFileSync(filePath: string, contents: string, options?: unknown): void {
+		this.events.push(`write:${filePath}`);
 		this.files.set(filePath, contents);
 		this.writeOptions.set(filePath, options);
 	}
 
 	renameSync(sourcePath: string, targetPath: string): void {
+		this.events.push(`rename:${sourcePath}:${targetPath}`);
 		this.renameCalls++;
 		const failureCode = this.failRenameCodes.shift();
 		if (failureCode) {
@@ -39,6 +46,25 @@ class FakeFs {
 		if (contents === undefined) throw new Error(`missing source file: ${sourcePath}`);
 		this.files.delete(sourcePath);
 		this.files.set(targetPath, contents);
+	}
+
+	openSync(filePath: string): number {
+		this.events.push(`open:${filePath}`);
+		const descriptor = this.nextDescriptor++;
+		this.descriptorPaths.set(descriptor, filePath);
+		return descriptor;
+	}
+
+	fsyncSync(descriptor: number): void {
+		const filePath = this.descriptorPaths.get(descriptor) ?? "unknown";
+		this.events.push(`fsync:${filePath}`);
+		this.fsyncCalls++;
+		if (this.failFsyncAt === this.fsyncCalls) throw new Error(`fsync failed for ${filePath}`);
+	}
+
+	closeSync(descriptor: number): void {
+		this.events.push(`close:${this.descriptorPaths.get(descriptor) ?? "unknown"}`);
+		this.descriptorPaths.delete(descriptor);
 	}
 
 	rmSync(filePath: string): void {
@@ -105,6 +131,41 @@ describe("writeAtomicJson", () => {
 		writeAtomicJson(targetPath, { sourceRunId: "run" });
 
 		assert.deepEqual([...fakeFs.writeOptions.values()], [{ encoding: "utf-8", mode: 0o600 }]);
+	});
+
+	it("syncs the temporary file before rename and the parent directory after it, without acknowledging any fault point", () => {
+		const targetPath = path.join("/tmp", "durable.json");
+		for (const testCase of [
+			{ name: "file sync", failFsyncAt: 1, renameCalls: 0 },
+			{ name: "rename", failRenameCodes: ["ENOSPC"], renameCalls: 1 },
+			{ name: "directory sync", failFsyncAt: 2, renameCalls: 1 },
+		] as const) {
+			const fakeFs = new FakeFs();
+			fakeFs.failFsyncAt = testCase.failFsyncAt;
+			fakeFs.failRenameCodes = testCase.failRenameCodes ? [...testCase.failRenameCodes] : [];
+			const writeDurableJson = createAtomicJsonWriter({
+				fs: fakeFs as any,
+				now: () => 12345,
+				pid: 678,
+				random: () => 0.5,
+				durable: true,
+			});
+
+			assert.throws(() => writeDurableJson(targetPath, { state: "running" }), /failed|ENOSPC/, testCase.name);
+			assert.equal(fakeFs.renameCalls, testCase.renameCalls, testCase.name);
+			if (testCase.name === "file sync") assert.equal(fakeFs.events.some((event) => event.startsWith("rename:")), false);
+			if (testCase.name === "rename") assert.equal(fakeFs.events.filter((event) => event.startsWith("fsync:")).length, 1);
+			if (testCase.name === "directory sync") assert.equal(fakeFs.files.get(targetPath), JSON.stringify({ state: "running" }, null, 2));
+		}
+
+		const fakeFs = new FakeFs();
+		const writeDurableJson = createAtomicJsonWriter({ fs: fakeFs as any, now: () => 12345, pid: 678, random: () => 0.5, durable: true });
+		writeDurableJson(targetPath, { state: "running" });
+		const order = fakeFs.events.filter((event) => event.startsWith("write:") || event.startsWith("fsync:") || event.startsWith("rename:"));
+		assert.equal(order[0]?.startsWith("write:"), true);
+		assert.equal(order[1]?.startsWith("fsync:"), true);
+		assert.equal(order[2]?.startsWith("rename:"), true);
+		assert.equal(order[3], `fsync:${path.dirname(targetPath)}`);
 	});
 
 	it("keeps temporary names below the component limit for long target names", () => {

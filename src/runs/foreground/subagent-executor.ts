@@ -67,7 +67,7 @@ import { currentCompletionOwnerId } from "../../shared/completion-owner.ts";
 import { applyIntercomBridgeToAgent, INTERCOM_BRIDGE_MARKER, resolveIntercomBridge, resolveIntercomSessionTarget, resolveSubagentIntercomTarget, type IntercomBridgeState } from "../../intercom/intercom-bridge.ts";
 import { formatControlIntercomMessage, formatControlNoticeMessage, resolveControlConfig, shouldNotifyControlEvent } from "../shared/subagent-control.ts";
 import { resolveTurnBudgetConfig } from "../shared/turn-budget.ts";
-import { REVIEW_CHECKPOINT_COLLECTION_RESERVE_MS, validateCheckpointPolicy } from "../shared/review-checkpoint.ts";
+import { formatReviewCheckpointFinding, REVIEW_CHECKPOINT_BUDGET_TRUNCATED_MARKER, validateCheckpointPolicy } from "../shared/review-checkpoint.ts";
 import { formatSpawnBudget, getSpawnBudgetSnapshot, grantSpawnBudget, preflightSpawnBudget, preflightSpawnBudgetGrant, reserveSpawnBudget } from "../shared/spawn-budget.ts";
 import { claimRunFanoutBatch, claimRunFanoutBatchWithCommit, createRunFanoutBudget, decodeRunFanoutBudgetDescriptor, formatRunFanoutBudget, getRunFanoutBudgetSnapshot, readRunFanoutBudgetDescriptor, RunFanoutLimitError, RUN_FANOUT_BUDGET_ENV, writeRunFanoutBudgetDescriptor } from "../shared/run-fanout-budget.ts";
 import { validateToolBudgetConfig } from "../shared/tool-budget.ts";
@@ -1872,12 +1872,29 @@ function resultSummaryForIntercom(result: SingleResult): string {
 	return output || result.error || "(no output)";
 }
 
+function escapeMachineOwnedTruncationLine(text: string): string {
+	return text.split(/\r?\n/).map((line) => line === REVIEW_CHECKPOINT_BUDGET_TRUNCATED_MARKER
+		? `Untrusted text: ${line}`
+		: line).join("\n");
+}
+
 function formatFailedSingleRunOutput(result: SingleResult, displayOutput: string): string {
-	const error = result.error || "Failed";
-	const output = displayOutput.trim();
+	const error = escapeMachineOwnedTruncationLine(result.error || "Failed");
+	const output = escapeMachineOwnedTruncationLine(displayOutput).trim();
 	const lines = [error];
 	if (output && output !== error.trim()) {
 		lines.push("", "Output:", output);
+	}
+	if (result.reviewFindings?.length) {
+		lines.push("", "Review checkpoint findings:", ...result.reviewFindings.map(formatReviewCheckpointFinding));
+	}
+	if (result.reviewCheckpointArtifactPath) {
+		lines.push("", `Review checkpoint artifact: ${result.reviewCheckpointArtifactPath}`);
+		if (result.terminalCause !== "completed") {
+			// This exact standalone line is machine-owned. Untrusted output and finding
+			// prose are escaped above so they cannot forge or duplicate it.
+			lines.push(REVIEW_CHECKPOINT_BUDGET_TRUNCATED_MARKER);
+		}
 	}
 	if (result.artifactPaths?.outputPath && fs.existsSync(result.artifactPaths.outputPath)) {
 		lines.push("", `Output artifact: ${result.artifactPaths.outputPath}`);
@@ -2268,7 +2285,16 @@ export function applySingleAgentLaunchDefaults(params: SubagentParamsLike, agent
 	const requestedTimeout = parentDefault
 		? agent.defaultTimeoutMs
 		: params.timeoutMs ?? params.maxRuntimeMs ?? agent.defaultTimeoutMs;
-	const clamped = clampWorkflowChildTimeout(requestedTimeout, params.workflowParentDeadlineAt);
+	const checkpointValidation = params.checkpointPolicy === undefined
+		? undefined
+		: validateCheckpointPolicy(params.checkpointPolicy, "workflow child checkpointPolicy");
+	if (checkpointValidation?.error) return { error: checkpointValidation.error };
+	const clamped = clampWorkflowChildTimeout(
+		requestedTimeout,
+		params.workflowParentDeadlineAt,
+		Date.now(),
+		checkpointValidation?.policy?.collectionReserveMs ?? 0,
+	);
 	if (clamped.error) return { error: clamped.error };
 	const { workflowParentTimeoutDefault: _workflowParentTimeoutDefault, ...withoutMarker } = params;
 	const withoutInternalTimeout = params.workflowParentDeadlineAt === undefined
@@ -3624,13 +3650,13 @@ export function clampWorkflowChildTimeout(
 	requestedTimeoutMs: unknown,
 	parentDeadlineAt: number | undefined,
 	now = Date.now(),
-	collectionReserveMs = REVIEW_CHECKPOINT_COLLECTION_RESERVE_MS,
+	collectionReserveMs = 0,
 ): { timeoutMs?: number; error?: string } {
 	if (parentDeadlineAt === undefined) {
 		return typeof requestedTimeoutMs === "number" ? { timeoutMs: requestedTimeoutMs } : {};
 	}
 	const available = Math.floor(parentDeadlineAt - now) - collectionReserveMs;
-	if (available <= 0) return { error: "Workflow deadline leaves no positive child interval after the 60000ms collection reserve." };
+	if (available <= 0) return { error: `Workflow deadline leaves no positive child interval after the ${collectionReserveMs}ms collection reserve.` };
 	if (requestedTimeoutMs === undefined) return { timeoutMs: available };
 	if (typeof requestedTimeoutMs !== "number") return {};
 	return { timeoutMs: Math.min(requestedTimeoutMs, available) };
@@ -3644,7 +3670,18 @@ export function prepareWorkflowLaunchParams(
 	options: { missionDetached?: boolean; suppressRoutineResultIntercom?: boolean; runFanoutBudget?: RunFanoutBudgetDescriptor; parentDeadlineAt?: number } = {},
 ): SubagentParamsLike {
 	const requestedTimeoutMs = childParams.timeoutMs ?? childParams.maxRuntimeMs ?? workflowDefaults.timeoutMs ?? workflowDefaults.maxRuntimeMs;
-	const clampedTimeout = clampWorkflowChildTimeout(requestedTimeoutMs, options.parentDeadlineAt);
+	const checkpointPolicyInput = childParams.checkpointPolicy ?? workflowDefaults.checkpointPolicy;
+	const checkpointValidation = checkpointPolicyInput === undefined
+		? undefined
+		: validateCheckpointPolicy(checkpointPolicyInput, "workflow child checkpointPolicy");
+	if (checkpointValidation?.error) throw new Error(checkpointValidation.error);
+	const checkpointPolicy = checkpointValidation?.policy;
+	const clampedTimeout = clampWorkflowChildTimeout(
+		requestedTimeoutMs,
+		options.parentDeadlineAt,
+		Date.now(),
+		checkpointPolicy?.collectionReserveMs ?? 0,
+	);
 	if (clampedTimeout.error) throw new Error(clampedTimeout.error);
 	if (typeof childParams.resume === "string") {
 		if (childParams.gate !== undefined || workflowDefaults.gate !== undefined) {
@@ -3683,6 +3720,7 @@ export function prepareWorkflowLaunchParams(
 		...(options.parentDeadlineAt !== undefined ? { workflowParentDeadlineAt: options.parentDeadlineAt } : {}),
 		...(options.runFanoutBudget ? { runFanoutBudget: { ...options.runFanoutBudget, parentPath: `${options.runFanoutBudget.parentPath ? `${options.runFanoutBudget.parentPath}/` : ""}workflow[${workflowKey}]` } } : {}),
 		...(options.suppressRoutineResultIntercom ? { suppressRoutineResultIntercom: true } : {}),
+		...(checkpointPolicy ? { checkpointPolicy } : {}),
 	} as SubagentParamsLike;
 	if (options.parentDeadlineAt !== undefined) delete launchParams.maxRuntimeMs;
 	const normalizedGate = normalizeGateParams(launchParams);
