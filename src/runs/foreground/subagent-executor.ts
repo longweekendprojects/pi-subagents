@@ -5055,15 +5055,15 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		if (canonicalParams.error) return buildRequestedModeError(effectiveParams, canonicalParams.error);
 		effectiveParams = canonicalParams.params!;
 		const modelScope = discovered.modelScope;
+		const checkpointPolicyInput = effectiveParams.checkpointPolicy ?? deps.config.checkpointPolicy;
+		const checkpointPolicy = checkpointPolicyInput === undefined ? undefined : validateCheckpointPolicy(checkpointPolicyInput, effectiveParams.checkpointPolicy === undefined ? "config.checkpointPolicy" : "checkpointPolicy");
+		if (checkpointPolicy?.error) return buildRequestedModeError(effectiveParams, checkpointPolicy.error);
+		if (checkpointPolicy?.policy) effectiveParams = { ...effectiveParams, checkpointPolicy: checkpointPolicy.policy };
 		const singleAgentDefaults = applySingleAgentLaunchDefaults(effectiveParams, discoveredAgents);
 		if (singleAgentDefaults.error) return buildRequestedModeError(effectiveParams, singleAgentDefaults.error);
 		effectiveParams = singleAgentDefaults.params!;
 		const turnBudget = resolveTurnBudgetConfig(effectiveParams.turnBudget ?? deps.config.turnBudget);
 		if (turnBudget.error) return buildRequestedModeError(effectiveParams, turnBudget.error);
-		const checkpointPolicyInput = effectiveParams.checkpointPolicy ?? deps.config.checkpointPolicy;
-		const checkpointPolicy = checkpointPolicyInput === undefined ? undefined : validateCheckpointPolicy(checkpointPolicyInput, effectiveParams.checkpointPolicy === undefined ? "config.checkpointPolicy" : "checkpointPolicy");
-		if (checkpointPolicy?.error) return buildRequestedModeError(effectiveParams, checkpointPolicy.error);
-		if (checkpointPolicy?.policy) effectiveParams = { ...effectiveParams, checkpointPolicy: checkpointPolicy.policy };
 		// An agent-level defaultContext is a preference, unlike an explicit request.
 		// Prefer fork only when the parent session is persisted and has a current leaf;
 		// otherwise use fresh immediately instead of launching a guaranteed-to-fail fork.

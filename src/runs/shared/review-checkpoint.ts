@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { writeDurablePrivateAtomicJson } from "../../shared/atomic-json.ts";
@@ -24,6 +25,7 @@ export const REVIEW_CHECKPOINT_MAX_LINE_RANGE = 200;
 export const REVIEW_CHECKPOINT_TOOL_NAME = "review_checkpoint";
 export const REVIEW_CHECKPOINT_POLICY_ENV = "PI_SUBAGENT_REVIEW_CHECKPOINT_POLICY";
 export const REVIEW_CHECKPOINT_STORE_ENV = "PI_SUBAGENT_REVIEW_CHECKPOINT_STORE";
+export const REVIEW_CHECKPOINT_ATTEMPT_ENV = "PI_SUBAGENT_REVIEW_CHECKPOINT_ATTEMPT";
 export const REVIEW_CHECKPOINT_FINALIZE_AT_ENV = "PI_SUBAGENT_REVIEW_CHECKPOINT_FINALIZE_AT";
 export const REVIEW_CHECKPOINT_BUDGET_TRUNCATED_MARKER = "BUDGET: truncated";
 
@@ -121,10 +123,17 @@ export const REVIEW_CHECKPOINT_PARAMETERS_SCHEMA: JsonSchemaObject = {
  */
 interface ReviewCheckpointStore {
 	version: 1;
+	/** Generated stores are accepted only when their durable sidecar matches. */
+	generation?: string;
 	records: ReviewCheckpointRecord[];
 	assistantTurn?: number;
 	checkpointSatisfied?: boolean;
 	permanentFinalization?: boolean;
+}
+
+interface ReviewCheckpointAcknowledgement {
+	version: 1;
+	generation: string;
 }
 
 export interface ReviewCheckpointStoreState extends ReviewCheckpointGateState {
@@ -135,6 +144,8 @@ export interface ReviewCheckpointIdentity {
 	runId: string;
 	childIndex: number;
 	agent: string;
+	/** Omitted legacy records belong to the first writer attempt. */
+	attempt?: number;
 }
 
 export interface ReviewCheckpointMachineArtifact {
@@ -160,8 +171,17 @@ function exactKeys(value: Record<string, unknown>, allowed: readonly string[]): 
 	return Object.keys(value).find((key) => !allowed.includes(key));
 }
 
+function normalizedAttempt(attempt: number | undefined): number {
+	return attempt ?? 1;
+}
+
 function sameIdentity(record: ReviewCheckpointRecord, identity: ReviewCheckpointIdentity | undefined): boolean {
-	return !identity || (record.runId === identity.runId && record.childIndex === identity.childIndex && record.agent === identity.agent);
+	return !identity || (
+		record.runId === identity.runId
+		&& record.childIndex === identity.childIndex
+		&& record.agent === identity.agent
+		&& normalizedAttempt(record.attempt) === normalizedAttempt(identity.attempt)
+	);
 }
 
 function lineValue(value: unknown): number | { start: number; end: number } | undefined {
@@ -250,12 +270,13 @@ export function validateReviewCheckpointSubmission(value: unknown, label = "revi
 
 export function validateReviewCheckpointRecord(value: unknown, identity?: ReviewCheckpointIdentity): ReviewCheckpointRecord | undefined {
 	if (!isRecord(value)) return undefined;
-	const allowed = ["version", "runId", "childIndex", "agent", "sequence", "timestamp", "assistantTurn", "submission"];
+	const allowed = ["version", "runId", "childIndex", "agent", "attempt", "sequence", "timestamp", "assistantTurn", "submission"];
 	if (exactKeys(value, allowed)) return undefined;
 	if (value.version !== REVIEW_CHECKPOINT_POLICY_VERSION
 		|| !nonEmptyString(value.runId)
 		|| !Number.isInteger(value.childIndex) || (value.childIndex as number) < 0
 		|| !nonEmptyString(value.agent)
+		|| (value.attempt !== undefined && (!Number.isInteger(value.attempt) || (value.attempt as number) < 1))
 		|| !Number.isInteger(value.sequence) || (value.sequence as number) < 1
 		|| !nonEmptyString(value.timestamp) || Number.isNaN(Date.parse(value.timestamp as string))
 		|| !Number.isInteger(value.assistantTurn) || (value.assistantTurn as number) < 1) return undefined;
@@ -266,6 +287,7 @@ export function validateReviewCheckpointRecord(value: unknown, identity?: Review
 		runId: (value.runId as string).trim(),
 		childIndex: value.childIndex as number,
 		agent: (value.agent as string).trim(),
+		...(value.attempt !== undefined ? { attempt: value.attempt as number } : {}),
 		sequence: value.sequence as number,
 		timestamp: value.timestamp as string,
 		assistantTurn: value.assistantTurn as number,
@@ -277,7 +299,7 @@ export function validateReviewCheckpointRecord(value: unknown, identity?: Review
 function sortAndDeduplicate(records: ReviewCheckpointRecord[]): ReviewCheckpointRecord[] {
 	const byKey = new Map<string, ReviewCheckpointRecord>();
 	for (const record of records) {
-		const key = `${record.runId}\u0000${record.childIndex}\u0000${record.agent}\u0000${record.sequence}`;
+		const key = `${record.runId}\u0000${record.childIndex}\u0000${record.agent}\u0000${normalizedAttempt(record.attempt)}\u0000${record.sequence}`;
 		const previous = byKey.get(key);
 		if (!previous || previous.timestamp <= record.timestamp) byKey.set(key, record);
 	}
@@ -291,7 +313,10 @@ const EMPTY_GATE_STATE: ReviewCheckpointGateState = {
 };
 
 type ReadStoreFile = {
+	exists: boolean;
 	valid: boolean;
+	acknowledged: boolean;
+	generation?: string;
 	records: ReviewCheckpointRecord[];
 	gateState: ReviewCheckpointGateState;
 };
@@ -307,58 +332,98 @@ function gateStateFromStore(store: ReviewCheckpointStore): ReviewCheckpointGateS
 	};
 }
 
+function validGeneration(value: unknown): value is string {
+	return typeof value === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(value);
+}
+
+function acknowledgementPath(storePath: string): string {
+	return `${storePath}.acknowledged`;
+}
+
+function emptyStoreFile(): ReadStoreFile {
+	return { exists: false, valid: true, acknowledged: true, records: [], gateState: { ...EMPTY_GATE_STATE } };
+}
+
+function invalidStoreFile(): ReadStoreFile {
+	return { exists: true, valid: false, acknowledged: false, records: [], gateState: { ...EMPTY_GATE_STATE } };
+}
+
+function readAcknowledgement(filePath: string): string | undefined {
+	try {
+		const value = JSON.parse(fs.readFileSync(acknowledgementPath(filePath), "utf-8")) as unknown;
+		if (!isRecord(value) || value.version !== REVIEW_CHECKPOINT_POLICY_VERSION || !validGeneration(value.generation) || exactKeys(value, ["version", "generation"])) return undefined;
+		return value.generation;
+	} catch {
+		return undefined;
+	}
+}
+
 function readStoreFile(filePath: string, identity?: ReviewCheckpointIdentity): ReadStoreFile {
 	let value: unknown;
 	try {
 		value = JSON.parse(fs.readFileSync(filePath, "utf-8"));
-	} catch {
-		return { valid: false, records: [], gateState: { ...EMPTY_GATE_STATE } };
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "ENOENT" ? emptyStoreFile() : invalidStoreFile();
 	}
 	if (!isRecord(value) || value.version !== REVIEW_CHECKPOINT_POLICY_VERSION || !Array.isArray(value.records)) {
-		return { valid: false, records: [], gateState: { ...EMPTY_GATE_STATE } };
+		return invalidStoreFile();
 	}
-	if ((value.assistantTurn !== undefined && (!Number.isInteger(value.assistantTurn) || (value.assistantTurn as number) < 0))
+	if ((value.generation !== undefined && !validGeneration(value.generation))
+		|| (value.assistantTurn !== undefined && (!Number.isInteger(value.assistantTurn) || (value.assistantTurn as number) < 0))
 		|| (value.checkpointSatisfied !== undefined && typeof value.checkpointSatisfied !== "boolean")
 		|| (value.permanentFinalization !== undefined && typeof value.permanentFinalization !== "boolean")) {
-		return { valid: false, records: [], gateState: { ...EMPTY_GATE_STATE } };
+		return invalidStoreFile();
 	}
 	const records = value.records.map((record) => validateReviewCheckpointRecord(record, identity));
-	if (records.some((record) => !record)) return { valid: false, records: [], gateState: { ...EMPTY_GATE_STATE } };
+	if (records.some((record) => !record)) return invalidStoreFile();
 	const store: ReviewCheckpointStore = {
 		version: REVIEW_CHECKPOINT_POLICY_VERSION,
+		...(value.generation !== undefined ? { generation: value.generation as string } : {}),
 		records: records as ReviewCheckpointRecord[],
 		...(value.assistantTurn !== undefined ? { assistantTurn: value.assistantTurn as number } : {}),
 		...(value.checkpointSatisfied !== undefined ? { checkpointSatisfied: value.checkpointSatisfied as boolean } : {}),
 		...(value.permanentFinalization !== undefined ? { permanentFinalization: value.permanentFinalization as boolean } : {}),
 	};
-	return { valid: true, records: store.records, gateState: gateStateFromStore(store) };
+	const acknowledged = store.generation === undefined || readAcknowledgement(filePath) === store.generation;
+	return {
+		exists: true,
+		valid: true,
+		acknowledged,
+		...(store.generation ? { generation: store.generation } : {}),
+		records: store.records,
+		gateState: gateStateFromStore(store),
+	};
 }
 
-function emptyStoreFile(): ReadStoreFile {
-	return { valid: true, records: [], gateState: { ...EMPTY_GATE_STATE } };
+function acknowledgedStore(store: ReadStoreFile): ReadStoreFile {
+	return store.valid && store.acknowledged ? store : emptyStoreFile();
 }
 
 function mergedStoreState(primary: ReadStoreFile, previous: ReadStoreFile): ReviewCheckpointStoreState {
-	const records = sortAndDeduplicate([...primary.records, ...previous.records]);
+	const acknowledgedPrimary = acknowledgedStore(primary);
+	const acknowledgedPrevious = acknowledgedStore(previous);
+	const records = sortAndDeduplicate([...acknowledgedPrimary.records, ...acknowledgedPrevious.records]);
 	const derived = gateStateFromStore({ version: REVIEW_CHECKPOINT_POLICY_VERSION, records });
 	return {
 		records,
-		assistantTurn: Math.max(primary.gateState.assistantTurn, previous.gateState.assistantTurn, derived.assistantTurn),
-		checkpointSatisfied: primary.gateState.checkpointSatisfied || previous.gateState.checkpointSatisfied || derived.checkpointSatisfied,
-		permanentFinalization: primary.gateState.permanentFinalization || previous.gateState.permanentFinalization || derived.permanentFinalization,
+		assistantTurn: Math.max(acknowledgedPrimary.gateState.assistantTurn, acknowledgedPrevious.gateState.assistantTurn, derived.assistantTurn),
+		checkpointSatisfied: acknowledgedPrimary.gateState.checkpointSatisfied || acknowledgedPrevious.gateState.checkpointSatisfied || derived.checkpointSatisfied,
+		permanentFinalization: acknowledgedPrimary.gateState.permanentFinalization || acknowledgedPrevious.gateState.permanentFinalization || derived.permanentFinalization,
 	};
 }
 
 function readPersistedStore(input: { storePath: string; identity: ReviewCheckpointIdentity }): { primary: ReadStoreFile; previous: ReadStoreFile; current: ReviewCheckpointStoreState } {
-	const primary = fs.existsSync(input.storePath) ? readStoreFile(input.storePath, input.identity) : emptyStoreFile();
-	const previous = fs.existsSync(`${input.storePath}.previous`) ? readStoreFile(`${input.storePath}.previous`, input.identity) : emptyStoreFile();
-	if (!primary.valid && !previous.valid) {
+	const primary = readStoreFile(input.storePath, input.identity);
+	const previous = readStoreFile(`${input.storePath}.previous`, input.identity);
+	const primaryAcknowledged = primary.exists && primary.valid && primary.acknowledged;
+	const previousAcknowledged = previous.exists && previous.valid && previous.acknowledged;
+	if ((primary.exists && !primary.valid && !previousAcknowledged) || (previous.exists && !previous.valid && !primaryAcknowledged)) {
 		throw new Error("review checkpoint store is unreadable; refusing to acknowledge a state transition that could erase prior evidence.");
 	}
 	return { primary, previous, current: mergedStoreState(primary, previous) };
 }
 
-/** Reads the current atomic snapshot and its predecessor so a torn newest write cannot erase acknowledged history or gate state. */
+/** Reads the current atomic snapshot and its predecessor so an unacknowledged newest write cannot erase durable history or gate state. */
 export function readReviewCheckpointStoreState(storePath: string | undefined, identity?: ReviewCheckpointIdentity): ReviewCheckpointStoreState {
 	if (!storePath) return { records: [], ...EMPTY_GATE_STATE };
 	const primary = readStoreFile(storePath, identity);
@@ -370,14 +435,25 @@ export function readReviewCheckpointStore(storePath: string | undefined, identit
 	return readReviewCheckpointStoreState(storePath, identity).records;
 }
 
-function recordStore(records: ReviewCheckpointRecord[], gateState: ReviewCheckpointGateState): ReviewCheckpointStore {
+function recordStore(records: ReviewCheckpointRecord[], gateState: ReviewCheckpointGateState, generation: string): ReviewCheckpointStore {
 	return {
 		version: REVIEW_CHECKPOINT_POLICY_VERSION,
+		generation,
 		records,
 		assistantTurn: gateState.assistantTurn,
 		checkpointSatisfied: gateState.checkpointSatisfied,
 		permanentFinalization: gateState.permanentFinalization,
 	};
+}
+
+function acknowledgement(generation: string): ReviewCheckpointAcknowledgement {
+	return { version: REVIEW_CHECKPOINT_POLICY_VERSION, generation };
+}
+
+function persistAcknowledgedStore(storePath: string, records: ReviewCheckpointRecord[], gateState: ReviewCheckpointGateState): void {
+	const generation = randomUUID();
+	writeDurablePrivateAtomicJson(storePath, recordStore(records, gateState, generation));
+	writeDurablePrivateAtomicJson(acknowledgementPath(storePath), acknowledgement(generation));
 }
 
 function persistStoreTransition(input: {
@@ -387,14 +463,16 @@ function persistStoreTransition(input: {
 	current: ReviewCheckpointStoreState;
 	next: ReviewCheckpointStoreState;
 }): void {
-	const hadPriorSnapshot = input.primary.records.length > 0
-		|| input.previous.records.length > 0
-		|| input.primary.gateState.assistantTurn > 0
-		|| input.previous.gateState.assistantTurn > 0;
+	const primary = acknowledgedStore(input.primary);
+	const previous = acknowledgedStore(input.previous);
+	const hadPriorSnapshot = primary.records.length > 0
+		|| previous.records.length > 0
+		|| primary.gateState.assistantTurn > 0
+		|| previous.gateState.assistantTurn > 0;
 	if (hadPriorSnapshot) {
-		writeDurablePrivateAtomicJson(`${input.storePath}.previous`, recordStore(input.current.records, input.current));
+		persistAcknowledgedStore(`${input.storePath}.previous`, input.current.records, input.current);
 	}
-	writeDurablePrivateAtomicJson(input.storePath, recordStore(input.next.records, input.next));
+	persistAcknowledgedStore(input.storePath, input.next.records, input.next);
 }
 
 /** Persists a logical assistant turn before that turn can investigate. State only moves forward across replacements. */
@@ -444,6 +522,7 @@ export function persistReviewCheckpoint(input: {
 		runId: input.identity.runId,
 		childIndex: input.identity.childIndex,
 		agent: input.identity.agent,
+		...(input.identity.attempt !== undefined ? { attempt: input.identity.attempt } : {}),
 		sequence: (persisted.current.records.at(-1)?.sequence ?? 0) + 1,
 		timestamp: (input.now ?? (() => new Date()))().toISOString(),
 		assistantTurn,
@@ -504,8 +583,14 @@ export function formatReviewCheckpointFinding(finding: ReviewCheckpointFinding):
 	return `${finding.severity}: ${finding.path}:${line} - ${escapeMachineOwnedMarker(finding.claim)}\nEvidence: ${escapeMachineOwnedMarker(finding.evidence)}`;
 }
 
-export function checkpointStorePath(root: string, runId: string, childIndex: number): string {
-	return path.join(root, "review-checkpoints", `${runId}-${childIndex}.json`);
+export function checkpointStorePath(root: string, runId: string, childIndex: number, attempt = 1): string {
+	return path.join(root, "review-checkpoints", attempt === 1 ? `${runId}-${childIndex}.json` : `${runId}-${childIndex}-attempt-${attempt}.json`);
+}
+
+/** Keeps the first-attempt path compatible while isolating each replacement writer. */
+export function checkpointAttemptStorePath(storePath: string, attempt: number): string {
+	if (!Number.isInteger(attempt) || attempt < 1) throw new Error("review checkpoint attempt must be a positive integer.");
+	return attempt === 1 ? storePath : `${storePath}.attempt-${attempt}`;
 }
 
 export function checkpointMachineArtifactPath(root: string, runId: string, childIndex: number): string {

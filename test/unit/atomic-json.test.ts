@@ -33,6 +33,14 @@ class FakeFs {
 		this.writeOptions.set(filePath, options);
 	}
 
+	readFileSync(filePath: string): string {
+		const contents = this.files.get(filePath);
+		if (contents !== undefined) return contents;
+		const error = new Error(`missing file: ${filePath}`) as NodeJS.ErrnoException;
+		error.code = "ENOENT";
+		throw error;
+	}
+
 	renameSync(sourcePath: string, targetPath: string): void {
 		this.events.push(`rename:${sourcePath}:${targetPath}`);
 		this.renameCalls++;
@@ -138,9 +146,10 @@ describe("writeAtomicJson", () => {
 		for (const testCase of [
 			{ name: "file sync", failFsyncAt: 1, renameCalls: 0 },
 			{ name: "rename", failRenameCodes: ["ENOSPC"], renameCalls: 1 },
-			{ name: "directory sync", failFsyncAt: 2, renameCalls: 1 },
+			{ name: "directory sync", failFsyncAt: 2, renameCalls: 2, preimage: JSON.stringify({ state: "previous" }, null, 2) },
 		] as const) {
 			const fakeFs = new FakeFs();
+			if (testCase.preimage) fakeFs.files.set(targetPath, testCase.preimage);
 			fakeFs.failFsyncAt = testCase.failFsyncAt;
 			fakeFs.failRenameCodes = testCase.failRenameCodes ? [...testCase.failRenameCodes] : [];
 			const writeDurableJson = createAtomicJsonWriter({
@@ -155,7 +164,7 @@ describe("writeAtomicJson", () => {
 			assert.equal(fakeFs.renameCalls, testCase.renameCalls, testCase.name);
 			if (testCase.name === "file sync") assert.equal(fakeFs.events.some((event) => event.startsWith("rename:")), false);
 			if (testCase.name === "rename") assert.equal(fakeFs.events.filter((event) => event.startsWith("fsync:")).length, 1);
-			if (testCase.name === "directory sync") assert.equal(fakeFs.files.get(targetPath), JSON.stringify({ state: "running" }, null, 2));
+			if (testCase.name === "directory sync") assert.equal(fakeFs.files.get(targetPath), testCase.preimage, "post-rename directory sync failure restores the destination pre-image");
 		}
 
 		const fakeFs = new FakeFs();

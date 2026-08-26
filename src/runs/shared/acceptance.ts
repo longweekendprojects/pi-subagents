@@ -1254,7 +1254,6 @@ export async function evaluateAcceptance(input: {
 		runtimeChecks: [],
 		verifyRuns: [],
 	};
-	if (acceptance.level === "none") return ledger;
 	if (input.requireCheckpoint && (!input.checkpointEvidence || input.checkpointEvidence.state !== "complete" || input.checkpointTerminalCause !== "completed")) {
 		const message = !input.checkpointEvidence
 			? "A validated final complete review checkpoint is required but none was recovered."
@@ -1266,6 +1265,7 @@ export async function evaluateAcceptance(input: {
 		ledger.evidenceStatus = "rejected";
 		return ledger;
 	}
+	if (acceptance.level === "none") return ledger;
 
 	const parsed = input.report
 		? (() => {

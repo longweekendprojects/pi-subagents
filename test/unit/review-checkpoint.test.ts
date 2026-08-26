@@ -13,7 +13,7 @@ import {
 } from "../../src/runs/shared/review-checkpoint.ts";
 
 describe("review checkpoints", () => {
-	it("persists structured incremental evidence through a torn newest snapshot without mining prose", () => {
+	it("recovers acknowledged legacy evidence when a newer generated snapshot lacks acknowledgement", () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "review-checkpoint-store-"));
 		try {
 			const storePath = path.join(dir, "checkpoint.json");
@@ -45,8 +45,14 @@ describe("review checkpoints", () => {
 				assistantTurn: 3,
 				submission: { kind: "final", status: "complete" },
 			});
-			fs.copyFileSync(storePath, `${storePath}.previous`);
-			fs.writeFileSync(storePath, "{\"version\":1,\"records\":[", "utf-8");
+			const legacyPredecessor = JSON.parse(fs.readFileSync(storePath, "utf-8")) as Record<string, unknown>;
+			delete legacyPredecessor.generation;
+			fs.writeFileSync(`${storePath}.previous`, JSON.stringify(legacyPredecessor), "utf-8");
+			const unacknowledgedPrimary = {
+				...JSON.parse(fs.readFileSync(storePath, "utf-8")) as Record<string, unknown>,
+				generation: "newer-unacknowledged",
+			};
+			fs.writeFileSync(storePath, JSON.stringify(unacknowledgedPrimary), "utf-8");
 			const transcriptPath = path.join(dir, "child.transcript.jsonl");
 			fs.writeFileSync(transcriptPath, [
 				JSON.stringify({ recordType: "message", role: "assistant", text: "blocker: prose must never become evidence" }),

@@ -100,7 +100,7 @@ import { acceptanceFailureMessage, buildSkippedAcceptanceLedger, evaluateAccepta
 import { PROMPT_REDACTED } from "../../shared/utils.ts";
 import { attachContractProjections, isAgentContractV1 } from "../shared/agent-contract.ts";
 import { appendTurnBudgetSystemPrompt, formatTurnBudgetOutput, initialTurnBudgetState, turnBudgetDecision, turnBudgetDeferredNote, turnBudgetDeferredState, turnBudgetExceededMessage, turnBudgetSoftNote, turnBudgetState } from "../shared/turn-budget.ts";
-import { checkpointMachineArtifactPath, checkpointStorePath, projectCheckpointEvidence, salvageReviewCheckpoints, validateCheckpointPolicy, writeReviewCheckpointMachineArtifact } from "../shared/review-checkpoint.ts";
+import { checkpointAttemptStorePath, checkpointMachineArtifactPath, checkpointStorePath, projectCheckpointEvidence, salvageReviewCheckpoints, validateCheckpointPolicy, writeReviewCheckpointMachineArtifact } from "../shared/review-checkpoint.ts";
 import { initialToolBudgetState, toolBudgetState } from "../shared/tool-budget.ts";
 import { resolveWatchdogConfig } from "../../watchdog/settings.ts";
 import { agentDefinitionDigest, launchBindingDigest } from "../../shared/launch-contract.ts";
@@ -375,6 +375,7 @@ async function runSingleAttempt(
 		structuredOutput: options.structuredOutput,
 		checkpointPolicy,
 		reviewCheckpointStorePath: options.reviewCheckpointStorePath,
+		checkpointAttempt: options.reviewCheckpointAttempt,
 		checkpointFinalizeAt: checkpointPolicy && options.timeoutMs !== undefined
 			? (options.deadlineAt ?? Date.now() + options.timeoutMs) - checkpointPolicy.finalizeReserveMs
 			: undefined,
@@ -1684,7 +1685,7 @@ async function runSyncCompletionInner(
 	const acceptancePrompt = formatAcceptancePrompt(effectiveAcceptance, { reportOptional: isAgentContractV1(options.agentContract) });
 	const taskWithAcceptance = acceptancePrompt ? `${task}\n${acceptancePrompt}` : task;
 	options.onEffectivePrompt?.(taskWithAcceptance);
-	const reviewCheckpointStorePath = checkpointPolicy
+	const reviewCheckpointStoreBasePath = checkpointPolicy
 		? options.reviewCheckpointStorePath ?? checkpointStorePath(
 			options.artifactsDir ?? path.join(TEMP_ROOT_DIR, "foreground"),
 			options.runId,
@@ -1789,7 +1790,6 @@ async function runSyncCompletionInner(
 	let detachedReason: string | undefined;
 	const attemptOptions: RunSyncOptions = {
 		...options,
-		...(reviewCheckpointStorePath ? { reviewCheckpointStorePath } : {}),
 		onDetachReceipt: (receipt) => {
 			receipt.acceptance = buildPendingAcceptanceLedger(effectiveAcceptance);
 			try {
@@ -1806,6 +1806,9 @@ async function runSyncCompletionInner(
 		},
 	};
 	let lastResult: SingleResult | undefined;
+	let checkpointAttempt = 0;
+	let finalCheckpointAttempt = 1;
+	let finalCheckpointStorePath = reviewCheckpointStoreBasePath;
 	const modelsToTry = candidates.length > 0 ? candidates : [undefined];
 	// Escalated to "file" after an unexplained zero-activity startup failure so
 	// retries keep the task text out of argv (endpoint pre-exec scans may deny it).
@@ -1814,7 +1817,15 @@ async function runSyncCompletionInner(
 		const candidate = modelsToTry[modelIndex];
 		for (let startupAttemptIndex = 0; ; startupAttemptIndex++) {
 			const outputSnapshot = captureSingleOutputSnapshot(options.outputPath);
-			const result = await runSingleAttempt(runtimeCwd, agent, taskWithAcceptance, candidate, attemptOptions, {
+			const currentCheckpointAttempt = checkpointPolicy ? ++checkpointAttempt : undefined;
+			const currentCheckpointStorePath = currentCheckpointAttempt && reviewCheckpointStoreBasePath
+				? checkpointAttemptStorePath(reviewCheckpointStoreBasePath, currentCheckpointAttempt)
+				: undefined;
+			const result = await runSingleAttempt(runtimeCwd, agent, taskWithAcceptance, candidate, {
+				...attemptOptions,
+				...(currentCheckpointStorePath ? { reviewCheckpointStorePath: currentCheckpointStorePath } : {}),
+				...(currentCheckpointAttempt ? { reviewCheckpointAttempt: currentCheckpointAttempt } : {}),
+			}, {
 				sessionEnabled,
 				systemPrompt,
 				resolvedSkillNames: resolvedSkills.length > 0 ? resolvedSkills.map((skill) => skill.name) : undefined,
@@ -1832,6 +1843,10 @@ async function runSyncCompletionInner(
 				orcaProgressTab,
 			});
 			lastResult = result;
+			if (currentCheckpointAttempt) {
+				finalCheckpointAttempt = currentCheckpointAttempt;
+				finalCheckpointStorePath = currentCheckpointStorePath;
+			}
 			if (startupAttemptIndex === 0) {
 				if (result.model) attemptedModels.push(result.model);
 				else if (candidate) attemptedModels.push(candidate);
@@ -1948,9 +1963,9 @@ async function runSyncCompletionInner(
 	if (transcriptWriter?.getError()) result.transcriptError = transcriptWriter.getError();
 	if (checkpointPolicy) {
 		const checkpoints = salvageReviewCheckpoints({
-			storePath: reviewCheckpointStorePath,
+			storePath: finalCheckpointStorePath,
 			transcriptPath: result.transcriptPath,
-			identity: { runId: options.runId, childIndex: options.index ?? 0, agent: agentName },
+			identity: { runId: options.runId, childIndex: options.index ?? 0, agent: agentName, attempt: finalCheckpointAttempt },
 		});
 		const evidence = projectCheckpointEvidence(checkpoints);
 		result.reviewCheckpointState = evidence.state;
@@ -2039,8 +2054,9 @@ async function runSyncCompletionInner(
 		result.acceptance = buildSkippedAcceptanceLedger(effectiveAcceptance, { id: "acceptance-evaluation", message });
 	}
 	const acceptanceFailure = acceptanceFailureMessage(result.acceptance);
+	const checkpointFailure = Boolean(checkpointPolicy && result.acceptance.runtimeChecks.some((check) => check.id === "review-checkpoint" && check.status === "failed"));
 	stripAcceptanceReportsFromMessages(result.messages);
-	if (acceptanceFailure && result.acceptance.explicit && result.exitCode === 0 && !result.interrupted && !result.timedOut && !isAgentContractV1(options.agentContract)) {
+	if (acceptanceFailure && (result.acceptance.explicit || checkpointFailure) && result.exitCode === 0 && !result.interrupted && !result.timedOut && (!isAgentContractV1(options.agentContract) || checkpointFailure)) {
 		result.exitCode = 1;
 		if (result.savedOutputPath) {
 			result.finalOutput = finalizeSingleOutput({

@@ -10,6 +10,7 @@ import { SUBAGENT_CHILD_AGENT_ENV, SUBAGENT_CHILD_INDEX_ENV, SUBAGENT_FANOUT_CHI
 import { RUNTIME_EXTENSION_ACK_EVENT, RUNTIME_EXTENSION_ACK_PATH_ENV, isRuntimeAcknowledgedExtensionId, writeRuntimeAcknowledgedExtensions } from "./runtime-acknowledged-extensions.ts";
 import { createStructuredOutputToolParameters, STRUCTURED_OUTPUT_CAPTURE_ENV, STRUCTURED_OUTPUT_SCHEMA_ENV, validateStructuredOutputValue } from "./structured-output.ts";
 import {
+	REVIEW_CHECKPOINT_ATTEMPT_ENV,
 	REVIEW_CHECKPOINT_FINALIZE_AT_ENV,
 	REVIEW_CHECKPOINT_PARAMETERS_SCHEMA,
 	REVIEW_CHECKPOINT_POLICY_ENV,
@@ -343,17 +344,22 @@ function registerReviewCheckpoint(pi: ExtensionAPI): void {
 	const childIndex = Number(process.env[SUBAGENT_CHILD_INDEX_ENV]);
 	const rawFinalizeAt = Number(process.env[REVIEW_CHECKPOINT_FINALIZE_AT_ENV]);
 	const finalizeAt = Number.isFinite(rawFinalizeAt) && rawFinalizeAt > 0 ? rawFinalizeAt : undefined;
-	if (!policy || !storePath || !runId || !agent || !Number.isInteger(childIndex) || childIndex < 0) {
+	const rawAttempt = process.env[REVIEW_CHECKPOINT_ATTEMPT_ENV];
+	const attempt = rawAttempt === undefined ? 1 : Number(rawAttempt);
+	if (!policy || !storePath || !runId || !agent || !Number.isInteger(childIndex) || childIndex < 0 || !Number.isInteger(attempt) || attempt < 1) {
 		throw new Error("Invalid review checkpoint runtime configuration.");
 	}
-	const identity = { runId, agent, childIndex };
+	const identity = { runId, agent, childIndex, attempt };
 	const recovered = readReviewCheckpointStoreState(storePath, identity);
 	let assistantTurn = recovered.assistantTurn;
 	let checkpointCompleted = recovered.checkpointSatisfied;
 	let permanentFinalization = recovered.permanentFinalization;
 	let gateStateError: string | undefined;
+	let investigativeCallAdmittedThisTurn = false;
+	let checkpointBoundaryThisTurn = false;
+	let pendingFinalizationThisTurn = false;
 	const structuredOutputActive = Boolean(process.env[STRUCTURED_OUTPUT_CAPTURE_ENV]);
-	const onRuntimeEvent = pi.on as unknown as (event: string, handler: (event: { toolName?: unknown }) => unknown) => void;
+	const onRuntimeEvent = pi.on as unknown as (event: string, handler: (event: { toolName?: unknown; input?: unknown }) => unknown) => void;
 	const finalizationIsDue = (): boolean => assistantTurn >= policy.requiredByTurn + policy.reserveTurns
 		|| (finalizeAt !== undefined && Date.now() >= finalizeAt);
 	const persistGateState = (nextPermanentFinalization = permanentFinalization): boolean => {
@@ -377,32 +383,57 @@ function registerReviewCheckpoint(pi: ExtensionAPI): void {
 	};
 	const beginFinalizationIfDue = (): boolean => permanentFinalization || finalizationIsDue();
 	const allowsFinalizationTool = (toolName: string): boolean => toolName === REVIEW_CHECKPOINT_TOOL_NAME || (toolName === "structured_output" && structuredOutputActive);
+	const checkpointToolValue = (input: unknown): unknown => input && typeof input === "object" && !Array.isArray(input) && Object.hasOwn(input, "value")
+		? (input as { value: unknown }).value
+		: input;
+	const finalCheckpointInput = (input: unknown): boolean => {
+		const value = checkpointToolValue(input);
+		return Boolean(value) && typeof value === "object" && !Array.isArray(value) && (value as { kind?: unknown }).kind === "final";
+	};
 	onRuntimeEvent("turn_start", () => {
 		assistantTurn += 1;
+		investigativeCallAdmittedThisTurn = false;
+		checkpointBoundaryThisTurn = false;
+		pendingFinalizationThisTurn = false;
 		persistGateState();
 		return undefined;
 	});
 	onRuntimeEvent("tool_call", (event) => {
 		const toolName = typeof event.toolName === "string" ? event.toolName : "tool";
+		const checkpointFinal = toolName === REVIEW_CHECKPOINT_TOOL_NAME && finalCheckpointInput(event.input);
+		if (toolName === REVIEW_CHECKPOINT_TOOL_NAME) {
+			if (checkpointFinal && investigativeCallAdmittedThisTurn) {
+				return { block: true, reason: `Review checkpoint finalization must precede investigative tools in assistant turn ${assistantTurn}.` };
+			}
+			if (pendingFinalizationThisTurn && !checkpointFinal) {
+				return { block: true, reason: `Review checkpoint finalization is pending in assistant turn ${assistantTurn}; retry the final checkpoint instead.` };
+			}
+			checkpointBoundaryThisTurn = true;
+			if (checkpointFinal) pendingFinalizationThisTurn = true;
+			return undefined;
+		}
 		if (gateStateError && !allowsFinalizationTool(toolName)) {
 			return { block: true, reason: `${gateStateError} Only finalization tools may retry durable recovery.` };
 		}
-		if (beginFinalizationIfDue()) {
-			return allowsFinalizationTool(toolName)
-				? undefined
-				: {
+		if (!allowsFinalizationTool(toolName)) {
+			if (beginFinalizationIfDue() || pendingFinalizationThisTurn) {
+				return {
 					block: true,
 					reason: `Review checkpoint finalization is permanent at assistant turn ${assistantTurn}. Only '${REVIEW_CHECKPOINT_TOOL_NAME}'${structuredOutputActive ? " and 'structured_output'" : ""} may run.`,
 				};
+			}
+			if (checkpointBoundaryThisTurn) {
+				return { block: true, reason: `Review checkpoint activity cannot reopen investigation during assistant turn ${assistantTurn}.` };
+			}
+			if (assistantTurn >= policy.requiredByTurn && !checkpointCompleted) {
+				return {
+					block: true,
+					reason: `Review checkpoint gate is active at assistant turn ${assistantTurn}. Only '${REVIEW_CHECKPOINT_TOOL_NAME}'${structuredOutputActive ? " and 'structured_output'" : ""} may run until a checkpoint persists.`,
+				};
+			}
+			investigativeCallAdmittedThisTurn = true;
 		}
-		if (gateStateError) return allowsFinalizationTool(toolName) ? undefined : { block: true, reason: `${gateStateError} Only finalization tools may retry durable recovery.` };
-		if (assistantTurn < policy.requiredByTurn || checkpointCompleted) return undefined;
-		return allowsFinalizationTool(toolName)
-			? undefined
-			: {
-				block: true,
-				reason: `Review checkpoint gate is active at assistant turn ${assistantTurn}. Only '${REVIEW_CHECKPOINT_TOOL_NAME}'${structuredOutputActive ? " and 'structured_output'" : ""} may run until a checkpoint persists.`,
-			};
+		return undefined;
 	});
 	if (typeof pi.registerTool !== "function") return;
 	const registerTool = pi.registerTool as unknown as (tool: {
@@ -418,10 +449,20 @@ function registerReviewCheckpoint(pi: ExtensionAPI): void {
 		description: "Persist one structured finding, explicit progress, or a final complete/truncated status. This is acknowledged only after durable persistence.",
 		parameters: createStructuredOutputToolParameters(REVIEW_CHECKPOINT_PARAMETERS_SCHEMA) as never,
 		async execute(_id: string, params: { value: unknown }) {
+			const declaredFinal = finalCheckpointInput({ value: params.value });
+			const clearFailedFinalization = (): void => {
+				if (declaredFinal && !permanentFinalization) pendingFinalizationThisTurn = false;
+			};
 			const schemaValidation = await validateStructuredOutputValue(REVIEW_CHECKPOINT_PARAMETERS_SCHEMA, params.value);
-			if (schemaValidation.status === "invalid") throw new Error(`Review checkpoint validation failed: ${schemaValidation.message}`);
+			if (schemaValidation.status === "invalid") {
+				clearFailedFinalization();
+				throw new Error(`Review checkpoint validation failed: ${schemaValidation.message}`);
+			}
 			const submission = validateReviewCheckpointSubmission(params.value);
-			if (!submission.submission) throw new Error(submission.error ?? "Review checkpoint validation failed.");
+			if (!submission.submission) {
+				clearFailedFinalization();
+				throw new Error(submission.error ?? "Review checkpoint validation failed.");
+			}
 			let record;
 			try {
 				record = persistReviewCheckpoint({
@@ -431,12 +472,12 @@ function registerReviewCheckpoint(pi: ExtensionAPI): void {
 					submission: submission.submission,
 				});
 			} catch (error) {
+				clearFailedFinalization();
 				throw new Error(`Review checkpoint persistence failed: ${error instanceof Error ? error.message : String(error)}`);
 			}
 			checkpointCompleted = true;
 			gateStateError = undefined;
-			// A final receipt carries the latch in the same durable primary snapshot,
-			// so no subsequent investigation tool can race its acknowledgement.
+			// The receipt and its durable gate state permanently close investigation.
 			if (submission.submission.kind === "final") permanentFinalization = true;
 			return {
 				content: [{ type: "text", text: "Review checkpoint persisted." }],

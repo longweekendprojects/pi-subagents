@@ -262,6 +262,30 @@ describe("nested event parsing and projection", () => {
 		assert.equal(control.nestedChildren?.[0]?.id, "nested-a");
 	});
 
+	it("retains checkpoint state in run and step summaries from async status", () => {
+		const summary = nestedSummaryFromAsyncStatus({
+			runId: "checkpoint-child",
+			mode: "single",
+			state: "running",
+			startedAt: 1,
+			checkpointPolicy: { version: 1 },
+			reviewCheckpointState: "incomplete",
+			steps: [{
+				agent: "reviewer",
+				status: "running",
+				checkpointPolicy: { version: 1 },
+				reviewCheckpointState: "truncated",
+			}],
+		} as never, "/tmp/checkpoint-child", {
+			id: "checkpoint-child",
+			parentRunId: "root-run",
+			depth: 1,
+			ts: 1,
+		});
+		assert.equal(summary.reviewCheckpointState, "incomplete");
+		assert.equal(summary.steps?.[0]?.reviewCheckpointState, "truncated");
+	});
+
 	it("attaches root children to visible step slices by original step index", () => {
 		const route = trackRoute();
 		writeNestedEvent(route, {

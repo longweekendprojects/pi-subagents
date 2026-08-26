@@ -3937,6 +3937,45 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(mockPi.callCount(), 2);
 	});
 
+	it("requires a replacement fallback attempt to provide its own final checkpoint", async () => {
+		const runId = "checkpoint-fallback-sync";
+		const storePath = path.join(tempDir, "checkpoint-fallback.json");
+		persistReviewCheckpoint({
+			storePath,
+			identity: { runId, agent: "reviewer", childIndex: 0, attempt: 1 },
+			assistantTurn: 1,
+			submission: { kind: "final", status: "complete" },
+		});
+		mockPi.onCall({
+			jsonl: [{
+				type: "message_end",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "primary provider failed" }],
+					model: "openai/gpt-5-mini",
+					errorMessage: "rate limit exceeded",
+					usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } },
+				},
+			}],
+			exitCode: 1,
+		});
+		mockPi.onCall({ output: "fallback completed without a checkpoint" });
+		const result = await runSync(tempDir, [makeAgent("reviewer", {
+			model: "openai/gpt-5-mini",
+			fallbackModels: ["anthropic/claude-sonnet-4"],
+		})], "reviewer", "Review the implementation", {
+			runId,
+			acceptance: false,
+			checkpointPolicy: { version: 1 },
+			reviewCheckpointStorePath: storePath,
+		});
+
+		assert.equal(result.modelAttempts?.length, 2);
+		assert.equal(result.reviewCheckpointState, "missing");
+		assert.equal(result.exitCode, 1);
+		assert.match(result.error ?? "", /final complete review checkpoint is required/);
+	});
+
 	it("retries with fallback models when provider errors exit zero", async () => {
 		mockPi.onCall({
 			jsonl: [{
@@ -4868,12 +4907,12 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(invalidResult.details?.timeoutMs, executorMod?.DEFAULT_FOREGROUND_TIMEOUT_MS);
 	});
 
-	it("rejects short checkpoint-enabled foreground workflow deadlines before a child can consume the collection reserve", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
-		const executor = makeExecutor([makeAgent("echo")], { timeoutMs: 250 });
+	it("reserves checkpoint collection time for globally configured foreground workflow policy", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const executor = makeExecutor([makeAgent("echo")], { timeoutMs: 250, checkpointPolicy: { version: 1 } });
 
 		const configResult = await executor.execute(
 			"workflow-config-timeout-default",
-			{ async: false, workflowScript: `return await runs.run("slow", { agent: "echo", task: "Wait", checkpointPolicy: { version: 1 } });` },
+			{ async: false, workflowScript: `return await runs.run("slow", { agent: "echo", task: "Wait" });` },
 			new AbortController().signal,
 			undefined,
 			makeMinimalCtx(tempDir),

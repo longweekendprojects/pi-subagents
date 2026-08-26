@@ -1158,6 +1158,80 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(mockPi.callCount(), 3);
 	});
 
+	it("applies every global terminal control after a sibling has ended locally", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		for (const testCase of [
+			{ name: "stop", cause: "explicit-stop", state: "stopped" as const },
+			{ name: "interrupt", cause: "interrupt", state: "paused" as const },
+			{ name: "deadline", cause: "workflow-deadline", state: "failed" as const },
+			{ name: "turn budget", cause: "turn-budget", state: "failed" as const },
+		] as const) {
+			const id = `async-local-then-${testCase.name.replace(/\s+/g, "-")}-${Date.now().toString(36)}`;
+			const releasePath = path.join(tempDir, `${id}.release`);
+			mockPi.onCall({
+				matchArgIncludes: "Local timeout",
+				steps: [
+					{ jsonl: [events.toolStart("bash", { command: "sleep" })] },
+					{ delay: 2_000 },
+				],
+			});
+			mockPi.onCall(testCase.name === "turn budget"
+				? {
+					matchArgIncludes: "Trigger control",
+					steps: [{
+						waitForPath: releasePath,
+						jsonl: [{
+							type: "message_end",
+							message: {
+								role: "assistant",
+								content: [{ type: "text", text: "budget trigger" }],
+								model: "mock/test-model",
+								stopReason: "length",
+								usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } },
+							},
+						}],
+					}],
+				}
+				: { matchArgIncludes: "Trigger control", delay: 2_000, output: "too late" });
+			mockPi.onCall({ matchArgIncludes: "Other active child", delay: 2_000, output: "too late" });
+			executeAsyncChain(id, {
+				chain: [{
+					parallel: [
+						{ agent: "local", task: "Local timeout" },
+						{ agent: "trigger", task: "Trigger control" },
+						{ agent: "other", task: "Other active child" },
+					],
+					concurrency: 3,
+				}],
+				resultMode: "parallel",
+				agents: [makeAgent("local"), makeAgent("trigger"), makeAgent("other")],
+				ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+				artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+				shareEnabled: false,
+				maxSubagentDepth: 2,
+				callToolTimeoutMs: 50,
+				...(testCase.name === "turn budget" ? { turnBudget: { maxTurns: 1, graceTurns: 0 } } : {}),
+			});
+			const asyncDir = path.join(ASYNC_DIR, id);
+			const localFailure = await waitForAsyncState(id, (status) => status.steps?.[0]?.status === "failed" && status.steps?.[1]?.status === "running" && status.steps?.[2]?.status === "running");
+			assert.match(localFailure.steps?.[0]?.error ?? "", /Tool 'bash' exceeded its timeout/);
+			if (testCase.name === "stop") deliverStopRequest({ asyncDir, pid: localFailure.pid, source: "test" });
+			else if (testCase.name === "interrupt") deliverInterruptRequest({ asyncDir, pid: localFailure.pid, source: "test" });
+			else if (testCase.name === "deadline") deliverTimeoutRequest({ asyncDir, pid: localFailure.pid, source: "test" });
+			else fs.writeFileSync(releasePath, "release", "utf-8");
+
+			const payload = await readAsyncPayload(id);
+			const status = await waitForAsyncState(id, (candidate) => candidate.state === testCase.state);
+			assert.equal(payload.state, testCase.state, testCase.name);
+			assert.equal((payload as { terminalCause?: string }).terminalCause, testCase.cause, testCase.name);
+			const expectedActiveStatuses = testCase.state === "paused"
+				? ["paused", "paused"]
+				: testCase.state === "stopped"
+					? ["stopped", "stopped"]
+					: ["failed", "failed"];
+			assert.deepEqual(status.steps?.slice(1).map((step) => step.status), expectedActiveStatuses, testCase.name);
+		}
+	});
+
 	it("marks async parallel runs that exceed timeoutMs as timed out", { skip: !isAsyncAvailable() ? "jiti not available" : process.platform === "win32" ? "timeout signal delivery intermittent on Windows CI" : undefined }, async () => {
 		mockPi.onCall({ delay: 5_000, output: "one done" });
 		mockPi.onCall({ delay: 5_000, output: "two done" });
@@ -2855,6 +2929,51 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.deepEqual(payload.results[0]?.modelAttempts?.map((attempt) => attempt.success), [false, true]);
 		assert.match(payload.results[0]?.output ?? "", /\[startup-retry\].*Recovered asynchronously after startup race/s);
 		assert.equal(mockPi.callCount(), 2);
+	});
+
+	it("requires a replacement async fallback attempt to provide its own final checkpoint", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const id = `async-checkpoint-fallback-${Date.now().toString(36)}`;
+		persistReviewCheckpoint({
+			storePath: path.join(ASYNC_DIR, id, "review-checkpoints", `${id}-0.json`),
+			identity: { runId: id, agent: "reviewer", childIndex: 0, attempt: 1 },
+			assistantTurn: 1,
+			submission: { kind: "final", status: "complete" },
+		});
+		mockPi.onCall({
+			jsonl: [{
+				type: "message_end",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "primary provider failed" }],
+					model: "openai/gpt-5-mini",
+					errorMessage: "rate limit exceeded",
+					usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } },
+				},
+			}],
+			exitCode: 1,
+		});
+		mockPi.onCall({ output: "fallback completed without a checkpoint" });
+		executeAsyncSingle(id, {
+			agent: "reviewer",
+			task: "Review the implementation",
+			agentConfig: makeAgent("reviewer", {
+				model: "openai/gpt-5-mini",
+				fallbackModels: ["anthropic/claude-sonnet-4"],
+			}),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			sessionRoot: path.join(tempDir, "sessions"),
+			maxSubagentDepth: 2,
+			acceptance: false,
+			checkpointPolicy: { version: 1 },
+		});
+		const payload = await readAsyncPayload(id);
+		const result = payload.results[0] as { reviewCheckpointState?: string; error?: string; modelAttempts?: Array<{ success?: boolean }> } | undefined;
+		assert.equal(payload.success, false);
+		assert.equal(result?.reviewCheckpointState, "missing");
+		assert.equal(result?.modelAttempts?.length, 2);
+		assert.match(result?.error ?? "", /Review checkpoint evidence is missing/);
 	});
 
 	it("background runs retry the fallback model when the provider stream ends without finish_reason", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {

@@ -635,6 +635,29 @@ describe("acceptance gates", () => {
 		}
 	});
 
+	it("requires a final checkpoint even when acceptance evidence is disabled", async () => {
+		const acceptance = resolveEffectiveAcceptance({ agentName: "reviewer", task: "Review-only. Do not edit.", explicit: false });
+		const missing = await evaluateAcceptance({
+			acceptance,
+			output: "no report",
+			cwd: process.cwd(),
+			requireCheckpoint: true,
+			checkpointTerminalCause: "completed",
+		});
+		assert.equal(missing.status, "rejected");
+		assert.match(acceptanceFailureMessage(missing) ?? "", /final complete review checkpoint is required/);
+
+		const complete = await evaluateAcceptance({
+			acceptance,
+			output: "no report",
+			cwd: process.cwd(),
+			requireCheckpoint: true,
+			checkpointEvidence: { state: "complete", findings: [], records: [] },
+			checkpointTerminalCause: "completed",
+		});
+		assert.equal(complete.status, "not-required");
+	});
+
 	it("accepts checkpoint-required review evidence only after final complete normal completion", async () => {
 		const cwd = tempRepo();
 		try {

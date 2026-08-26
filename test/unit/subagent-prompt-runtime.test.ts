@@ -210,60 +210,72 @@ describe("subagent prompt runtime", () => {
 		}
 	});
 
-	it("uses turn_start ordering to reopen after a durable checkpoint and keep finalization on a positive allowlist", async () => {
+	it("orders final checkpoints ahead of investigative siblings and keeps failed final persistence retryable", async () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "subagent-review-runtime-"));
 		try {
 			const blockedParent = path.join(dir, "blocked-parent");
-			fs.writeFileSync(blockedParent, "not a directory", "utf-8");
 			process.env[REVIEW_CHECKPOINT_POLICY_ENV] = JSON.stringify({ version: 1 });
-			process.env[REVIEW_CHECKPOINT_STORE_ENV] = path.join(blockedParent, "checkpoint.json");
+			process.env[REVIEW_CHECKPOINT_STORE_ENV] = path.join(dir, "early-checkpoint.json");
 			process.env[STRUCTURED_OUTPUT_CAPTURE_ENV] = path.join(dir, "structured.json");
 			process.env[SUBAGENT_RUN_ID_ENV] = "checkpoint-run";
 			process.env[SUBAGENT_CHILD_AGENT_ENV] = "reviewer";
 			process.env[SUBAGENT_CHILD_INDEX_ENV] = "0";
-			const handlers = new Map<string, Array<(event: { toolName?: string }) => unknown>>();
-			let checkpointTool: { execute: (_id: string, params: { value: unknown }) => Promise<unknown> } | undefined;
-			registerSubagentPromptRuntime({
-				on(event: string, handler: (event: { toolName?: string }) => unknown) {
-					handlers.set(event, [...(handlers.get(event) ?? []), handler]);
-				},
-				registerTool(tool: { name: string; execute: (_id: string, params: { value: unknown }) => Promise<unknown> }) {
-					if (tool.name === REVIEW_CHECKPOINT_TOOL_NAME) checkpointTool = tool;
-				},
-			} as never);
-			const decisions = async (toolName: string) => Promise.all((handlers.get("tool_call") ?? []).map((handler) => handler({ toolName })));
-			const blocked = async (toolName: string) => (await decisions(toolName)).some((decision) => (decision as { block?: boolean } | undefined)?.block === true);
-			for (let turn = 0; turn < 3; turn++) {
-				for (const handler of handlers.get("turn_start") ?? []) handler({});
-			}
-			assert.equal(await blocked("bash"), true, "turn-three investigation must wait for a durable receipt");
-			assert.ok(checkpointTool, "review_checkpoint must register");
-			await assert.rejects(checkpointTool.execute("invalid", { value: { kind: "finding" } }), /validation failed/);
-			assert.equal(await blocked(REVIEW_CHECKPOINT_TOOL_NAME), false, "failed checkpoint validation remains retryable");
-			assert.equal(await blocked("structured_output"), false, "active structured output remains retryable");
+			const createRuntime = () => {
+				const handlers = new Map<string, Array<(event: { toolName?: string; input?: unknown }) => unknown>>();
+				let checkpointTool: { execute: (_id: string, params: { value: unknown }) => Promise<unknown> } | undefined;
+				registerSubagentPromptRuntime({
+					on(event: string, handler: (event: { toolName?: string; input?: unknown }) => unknown) {
+						handlers.set(event, [...(handlers.get(event) ?? []), handler]);
+					},
+					registerTool(tool: { name: string; execute: (_id: string, params: { value: unknown }) => Promise<unknown> }) {
+						if (tool.name === REVIEW_CHECKPOINT_TOOL_NAME) checkpointTool = tool;
+					},
+				} as never);
+				return {
+					startTurn() {
+						for (const handler of handlers.get("turn_start") ?? []) handler({});
+					},
+					async blocked(toolName: string, input?: unknown) {
+						const decisions = await Promise.all((handlers.get("tool_call") ?? []).map((handler) => handler({ toolName, input })));
+						return decisions.some((decision) => (decision as { block?: boolean } | undefined)?.block === true);
+					},
+					tool() {
+						assert.ok(checkpointTool, "review_checkpoint must register");
+						return checkpointTool;
+					},
+				};
+			};
+
+			const runtime = createRuntime();
+			runtime.startTurn();
+			assert.equal(await runtime.blocked("bash"), false, "an early investigative call is admitted");
+			assert.equal(await runtime.blocked(REVIEW_CHECKPOINT_TOOL_NAME, { value: { kind: "final", status: "complete" } }), true, "an investigation-first batch rejects finalization");
+
+			fs.writeFileSync(blockedParent, "not a directory", "utf-8");
+			process.env[REVIEW_CHECKPOINT_STORE_ENV] = path.join(blockedParent, "checkpoint.json");
+			const finalRuntime = createRuntime();
+			finalRuntime.startTurn();
+			assert.equal(await finalRuntime.blocked(REVIEW_CHECKPOINT_TOOL_NAME, { value: { kind: "final", status: "complete" } }), false, "a final-first batch pre-latches the turn");
+			assert.equal(await finalRuntime.blocked("bash"), true, "a final-first batch blocks investigative siblings");
+			await assert.rejects(finalRuntime.tool().execute("failed-final", { value: { kind: "final", status: "complete" } }), /persistence failed/);
+			assert.equal(await finalRuntime.blocked(REVIEW_CHECKPOINT_TOOL_NAME, { value: { kind: "final", status: "complete" } }), false, "failed final persistence remains retryable");
+			assert.equal(await finalRuntime.blocked("read"), true, "a failed final does not reopen investigation in the same turn");
 			fs.rmSync(blockedParent, { force: true });
 			fs.mkdirSync(blockedParent);
-			await checkpointTool.execute("progress", { value: { kind: "progress", status: "no-confirmed-finding-yet" } });
-			assert.equal(await blocked("bash"), false, "a durable halfway checkpoint reopens investigation");
-			await checkpointTool.execute("final", { value: { kind: "final", status: "complete" } });
-			assert.equal(await blocked("bash"), true, "a final receipt on turn three immediately closes investigation");
-			assert.equal(await blocked("mcp_remote"), true, "successful checkpoints do not reopen finalization tools");
+			await finalRuntime.tool().execute("final", { value: { kind: "final", status: "complete" } });
+			assert.equal(await finalRuntime.blocked("mcp_remote"), true, "durable finalization remains permanent");
 
-			const replacementHandlers = new Map<string, Array<(event: { toolName?: string }) => unknown>>();
-			let replacementCheckpointTool: { execute: (_id: string, params: { value: unknown }) => Promise<unknown> } | undefined;
-			registerSubagentPromptRuntime({
-				on(event: string, handler: (event: { toolName?: string }) => unknown) {
-					replacementHandlers.set(event, [...(replacementHandlers.get(event) ?? []), handler]);
-				},
-				registerTool(tool: { name: string; execute: (_id: string, params: { value: unknown }) => Promise<unknown> }) {
-					if (tool.name === REVIEW_CHECKPOINT_TOOL_NAME) replacementCheckpointTool = tool;
-				},
-			} as never);
-			for (const handler of replacementHandlers.get("turn_start") ?? []) handler({});
-			const replacementBlocked = async (toolName: string) => (await Promise.all((replacementHandlers.get("tool_call") ?? []).map((handler) => handler({ toolName })))).some((decision) => (decision as { block?: boolean } | undefined)?.block === true);
-			assert.equal(await replacementBlocked("read"), true, "a replacement cannot reopen a recovered final checkpoint");
-			assert.equal(await replacementBlocked(REVIEW_CHECKPOINT_TOOL_NAME), false, "only finalization tools remain eligible after recovery");
-			assert.ok(replacementCheckpointTool, "replacement runtime keeps the finalization tool available");
+			const replacement = createRuntime();
+			replacement.startTurn();
+			assert.equal(await replacement.blocked("read"), true, "a replacement cannot reopen a recovered final checkpoint");
+
+			process.env[REVIEW_CHECKPOINT_STORE_ENV] = path.join(dir, "turn-three.json");
+			const turnThree = createRuntime();
+			for (let turn = 0; turn < 3; turn++) turnThree.startTurn();
+			assert.equal(await turnThree.blocked("bash"), true, "turn-three investigation waits for a checkpoint");
+			assert.equal(await turnThree.blocked(REVIEW_CHECKPOINT_TOOL_NAME, { value: { kind: "progress", status: "no-confirmed-finding-yet" } }), false);
+			await turnThree.tool().execute("progress", { value: { kind: "progress", status: "no-confirmed-finding-yet" } });
+			assert.equal(await turnThree.blocked("bash"), true, "a checkpoint cannot reopen investigation in the same turn");
 		} finally {
 			fs.rmSync(dir, { recursive: true, force: true });
 		}

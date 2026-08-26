@@ -144,6 +144,8 @@ export interface ReviewCheckpointRecord {
 	runId: string;
 	childIndex: number;
 	agent: string;
+	/** Writer-attempt discriminator. Legacy records without it belong to attempt one. */
+	attempt?: number;
 	sequence: number;
 	timestamp: string;
 	assistantTurn: number;
@@ -1949,6 +1951,8 @@ export interface RunSyncOptions {
 	checkpointPolicy?: ReviewCheckpointPolicyInput;
 	/** Durable private checkpoint store supplied by the parent runner. */
 	reviewCheckpointStorePath?: string;
+	/** Writer-attempt discriminator for the durable checkpoint store. */
+	reviewCheckpointAttempt?: number;
 	usageBudget?: UsageBudgetConfig;
 	/** Enforce maxTurns + graceTurns as a hard model-turn boundary. */
 	enforceHardTurnLimit?: boolean;
