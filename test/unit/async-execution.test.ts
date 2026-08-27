@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { describe, it } from "node:test";
 import { buildAsyncRunnerSteps, DEFAULT_ASYNC_TIMEOUT_MS, formatAsyncStartedMessage, resolveAsyncRunnerLogPaths } from "../../src/runs/background/async-execution.ts";
 import type { AgentConfig } from "../../src/agents/agents.ts";
+import { REVIEW_CHECKPOINT_POLICY_V1 } from "../../src/runs/shared/review-checkpoint.ts";
 
 const agent = (name: string, toolBudget?: AgentConfig["toolBudget"]): AgentConfig => ({
 	name,
@@ -132,6 +133,47 @@ describe("async runner execution", () => {
 			maxSubagentDepth: 2,
 		});
 		assert.deepEqual(rejected, { error: "Agent 'external' uses runner.type='external-cli' and does not support: model override." });
+	});
+
+	it("rejects checkpoint-enabled external composite children and binds normalized policy into composite launch digests", () => {
+		const external = agent("external");
+		external.runner = { type: "external-cli", command: process.execPath };
+		for (const testCase of [
+			{ name: "chain", chain: [{ agent: "external", task: "review" }] },
+			{ name: "parallel", chain: [{ parallel: [{ agent: "external", task: "review" }] }] },
+			{ name: "dynamic", chain: [{ agent: "producer", task: "produce", as: "seed" }, { expand: { from: { output: "seed", path: "/items" }, maxItems: 1 }, parallel: { agent: "external", task: "review" }, collect: { as: "results" } }] },
+		] as const) {
+			const rejected = buildAsyncRunnerSteps(`checkpoint-${testCase.name}`, {
+				chain: testCase.chain as any,
+				agents: testCase.name === "dynamic" ? [agent("producer"), external] : [external],
+				ctx,
+				asyncDir: path.join(process.cwd(), ".tmp-external-checkpoint-test"),
+				maxSubagentDepth: 2,
+				checkpointPolicy: REVIEW_CHECKPOINT_POLICY_V1,
+			});
+			assert.ok("error" in rejected, testCase.name);
+			assert.match(rejected.error, /review checkpoints/, testCase.name);
+		}
+
+		const baseline = buildAsyncRunnerSteps("digest-baseline", {
+			chain: [{ agent: "worker", task: "review this launch" }],
+			agents: [agent("worker")],
+			ctx,
+			asyncDir: path.join(process.cwd(), ".tmp-digest-test"),
+			maxSubagentDepth: 2,
+		});
+		const checkpointed = buildAsyncRunnerSteps("digest-checkpointed", {
+			chain: [{ agent: "worker", task: "review this launch" }],
+			agents: [agent("worker")],
+			ctx,
+			asyncDir: path.join(process.cwd(), ".tmp-digest-test"),
+			maxSubagentDepth: 2,
+			checkpointPolicy: REVIEW_CHECKPOINT_POLICY_V1,
+		});
+		assert.ok("steps" in baseline && "steps" in checkpointed);
+		assert.ok(baseline.steps[0]?.definitionDigest);
+		assert.equal(checkpointed.steps[0]?.checkpointPolicy?.collectionReserveMs, 60000);
+		assert.notEqual(baseline.steps[0]?.launchContractDigest, checkpointed.steps[0]?.launchContractDigest);
 	});
 
 	it("uses config default when no step, run, or agent budget exists", () => {

@@ -46,6 +46,7 @@ interface ChildTranscriptEvent {
 	toolCallId?: string;
 	toolName?: string;
 	args?: unknown;
+	details?: unknown;
 	isError?: boolean;
 }
 
@@ -220,7 +221,31 @@ export function createChildTranscriptWriter(input: ChildTranscriptWriterInput): 
 		},
 		writeChildEvent(event: ChildTranscriptEvent) {
 			if ((event.type === "message_end" || event.type === "tool_result_end") && event.message) {
-				writeMessage(event.type, event.message);
+				const detailsPayload = event.type === "tool_result_end" ? boundedPayload(event.details) : undefined;
+				if (detailsPayload && event.message.role === "toolResult") {
+					const message = event.message;
+					const output = boundedPayload(extractTextFromContent(message.content));
+					writeRecord({
+						...baseRecord("message"),
+						sourceEventType: event.type,
+						role: message.role,
+						toolCallId: message.toolCallId,
+						toolName: message.toolName,
+						isError: message.isError,
+						...(output ? { text: output, outputTruncated: output.includes("… payload truncated") } : {}),
+						detailsPayload,
+						message: {
+							role: message.role,
+							toolCallId: message.toolCallId,
+							toolName: message.toolName,
+							isError: message.isError,
+							content: output ? [{ type: "text", text: output }] : [],
+							...(message.timestamp !== undefined ? { timestamp: message.timestamp } : {}),
+						},
+					});
+				} else {
+					writeMessage(event.type, event.message);
+				}
 				return;
 			}
 			if (event.type === "tool_execution_start" && event.toolName) {
@@ -261,4 +286,46 @@ export function createChildTranscriptWriter(input: ChildTranscriptWriterInput): 
 			return writeError;
 		},
 	};
+}
+
+/**
+ * Reads only completed tool-result records from a bounded JSONL transcript.
+ * Malformed lines are ignored so a torn tail cannot discard prior receipts.
+ */
+export function readAcknowledgedChildToolResultDetails(transcriptPath: string, toolName: string, maxBytes = 8 * 1024 * 1024): unknown[] {
+	let content: string;
+	try {
+		const stat = fs.statSync(transcriptPath);
+		const start = Math.max(0, stat.size - maxBytes);
+		const fd = fs.openSync(transcriptPath, "r");
+		try {
+			const buffer = Buffer.alloc(Math.min(maxBytes, stat.size));
+			fs.readSync(fd, buffer, 0, buffer.length, start);
+			content = buffer.toString("utf-8");
+		} finally {
+			fs.closeSync(fd);
+		}
+	} catch {
+		return [];
+	}
+	const lines = content.split(/\r?\n/);
+	if (content.length >= maxBytes) lines.shift();
+	const details: unknown[] = [];
+	for (const line of lines) {
+		if (!line.trim()) continue;
+		try {
+			const record = JSON.parse(line) as {
+				recordType?: unknown;
+				role?: unknown;
+				toolName?: unknown;
+				isError?: unknown;
+				detailsPayload?: unknown;
+			};
+			if (record.recordType !== "message" || record.role !== "toolResult" || record.toolName !== toolName || record.isError === true || typeof record.detailsPayload !== "string") continue;
+			details.push(JSON.parse(record.detailsPayload));
+		} catch {
+			// A torn tail or invalid tool receipt cannot become evidence.
+		}
+	}
+	return details;
 }

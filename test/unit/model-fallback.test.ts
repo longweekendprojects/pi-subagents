@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
 	buildModelCandidates,
+	classifyAssistantProviderFailure,
 	fuzzyResolveModel,
 	isRetryableModelFailure,
 	normalizeModelSegment,
@@ -82,6 +83,19 @@ describe("model fallback helpers", () => {
 			"[pi-subagents] Skipping fallback model 'does-not-exist' because it is unavailable in this environment.",
 			"[pi-subagents] Skipping fallback model 'also-unavailable' because it is unavailable in this environment.",
 		]);
+	});
+
+	it("classifies terminal assistant provider failures without changing their message", () => {
+		for (const testCase of [
+			{ stopReason: "error", errorMessage: "HTTP 429: retry in 172800 seconds", expected: { terminalCause: "rate-limit", error: "HTTP 429: retry in 172800 seconds" } },
+			{ stopReason: "error", errorMessage: "rate_limit_exceeded", expected: { terminalCause: "rate-limit", error: "rate_limit_exceeded" } },
+			{ stopReason: "error", errorMessage: "provider transport failed", expected: { terminalCause: "provider-error", error: "provider transport failed" } },
+			{ stopReason: "stop", errorMessage: "provider transport failed", expected: undefined },
+			{ stopReason: "error", errorMessage: "bash failed (exit 1): request timed out", expected: undefined },
+			{ stopReason: "stop", errorMessage: undefined, expected: undefined },
+		] as const) {
+			assert.deepEqual(classifyAssistantProviderFailure(testCase.stopReason, testCase.errorMessage), testCase.expected);
+		}
 	});
 
 	it("detects retryable provider/model failures", () => {

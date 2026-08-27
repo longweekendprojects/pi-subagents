@@ -26,6 +26,7 @@ import { resolveSubagentLaunchContract } from "../../src/api/preflight.ts";
 import { discoverAgents } from "../../src/agents/agents.ts";
 import { runSync } from "../../src/runs/foreground/execution.ts";
 import { ACTIVE_ASYNC_CAPACITY_DIR, acquireActiveAsyncCapacity, activeAsyncCapacitySessionKey } from "../../src/runs/background/active-async-capacity.ts";
+import { REVIEW_CHECKPOINT_BUDGET_TRUNCATED_MARKER, persistReviewCheckpoint } from "../../src/runs/shared/review-checkpoint.ts";
 
 interface LaunchResolvedExtensions {
 	version?: number;
@@ -74,13 +75,14 @@ interface AsyncResultPayload {
 	deadlineAt?: number;
 	timedOut?: boolean;
 	stopped?: boolean;
+	terminalCause?: string;
 	turnBudget?: { maxTurns: number; graceTurns: number; outcome: string; turnCount: number; wrapUpRequestedAtTurn?: number; terminationDeferredAtTurn?: number; exceededAtTurn?: number };
 	turnBudgetExceeded?: boolean;
 	wrapUpRequested?: boolean;
 	totalTokens?: { input: number; output: number; total: number };
 	totalCost?: { inputTokens: number; outputTokens: number; costUsd: number };
 	usageBudget?: UsageBudgetState;
-	results: Array<{ agent?: string; launchContractDigest?: string; launchResolvedExtensions?: LaunchResolvedExtensions; runtimeAcknowledgedExtensions?: RuntimeAcknowledgedExtensions; output?: string; outputState?: "present" | "absent" | "unknown"; success?: boolean; error?: string; protocolError?: { code?: string; stream?: string; limitBytes?: number; observedBytes?: number }; timedOut?: boolean; stopped?: boolean; turnBudget?: { maxTurns: number; graceTurns: number; outcome: string; turnCount: number; wrapUpRequestedAtTurn?: number; terminationDeferredAtTurn?: number; exceededAtTurn?: number }; turnBudgetExceeded?: boolean; wrapUpRequested?: boolean; model?: string; attemptedModels?: string[]; modelAttempts?: Array<{ success?: boolean; error?: string }>; totalCost?: { inputTokens: number; outputTokens: number; costUsd: number }; structuredOutput?: unknown; agentContract?: { version: 1 }; execution?: { status?: string; success?: boolean; exitCode?: number }; effects?: { fileMutation?: { status?: string; expected?: boolean; attempted?: boolean } }; intercomTarget?: string; acceptance?: { status?: string; effectiveAcceptance?: { level?: string }; childReport?: unknown; runtimeChecks?: Array<{ id?: string; status?: string; message?: string }> }; artifactPaths?: { outputPath?: string; inputPath?: string; metadataPath?: string; transcriptPath?: string }; outputSaveError?: string; metadataSaveError?: string; capabilityCeiling?: { version?: number; allowedTools?: string[]; denyExtensions?: boolean; sources?: string[] }; capabilityAudit?: { effectiveTools?: string[]; removedTools?: string[]; extensionsDenied?: boolean } }>;
+	results: Array<{ agent?: string; launchContractDigest?: string; launchResolvedExtensions?: LaunchResolvedExtensions; runtimeAcknowledgedExtensions?: RuntimeAcknowledgedExtensions; output?: string; outputState?: "present" | "absent" | "unknown"; success?: boolean; error?: string; protocolError?: { code?: string; stream?: string; limitBytes?: number; observedBytes?: number }; timedOut?: boolean; stopped?: boolean; terminalCause?: string; reviewCheckpointState?: string; reviewFindings?: unknown[]; reviewCheckpointArtifactPath?: string; turnBudget?: { maxTurns: number; graceTurns: number; outcome: string; turnCount: number; wrapUpRequestedAtTurn?: number; terminationDeferredAtTurn?: number; exceededAtTurn?: number }; turnBudgetExceeded?: boolean; wrapUpRequested?: boolean; model?: string; attemptedModels?: string[]; modelAttempts?: Array<{ success?: boolean; error?: string }>; totalCost?: { inputTokens: number; outputTokens: number; costUsd: number }; structuredOutput?: unknown; agentContract?: { version: 1 }; execution?: { status?: string; success?: boolean; exitCode?: number }; effects?: { fileMutation?: { status?: string; expected?: boolean; attempted?: boolean } }; intercomTarget?: string; acceptance?: { status?: string; effectiveAcceptance?: { level?: string }; childReport?: unknown; runtimeChecks?: Array<{ id?: string; status?: string; message?: string }> }; artifactPaths?: { outputPath?: string; inputPath?: string; metadataPath?: string; transcriptPath?: string }; outputSaveError?: string; metadataSaveError?: string; capabilityCeiling?: { version?: number; allowedTools?: string[]; denyExtensions?: boolean; sources?: string[] }; capabilityAudit?: { effectiveTools?: string[]; removedTools?: string[]; extensionsDenied?: boolean } }>;
 	outputs?: Record<string, { text?: string; structured?: unknown }>;
 	workflowGraph?: { nodes?: Array<{ kind?: string; label?: string; phase?: string; status?: string; acceptanceStatus?: string; error?: string; outputName?: string; structured?: boolean; children?: Array<{ label?: string; outputName?: string; itemKey?: string; status?: string; acceptanceStatus?: string; error?: string }> }> };
 	parallelHandoff?: { version?: number; path?: string; groupCount?: number; childCount?: number; changedPatches?: number; cleanupState?: string };
@@ -615,21 +617,36 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		const agentName = `contract-worker-${Date.now().toString(36)}`;
 		const task = "Compare the resolved launch inputs.";
 		const turnBudget = { maxTurns: 2, graceTurns: 1 } as const;
+		const checkpointPolicy = { version: 1 } as const;
 		const agentPath = path.join(tempDir, ".pi", "agents", `${agentName}.md`);
 		fs.mkdirSync(path.dirname(agentPath), { recursive: true });
 		fs.writeFileSync(agentPath, `---\nname: ${agentName}\ndescription: Contract comparison worker\n---\n`, "utf-8");
 		const discovered = discoverAgents(tempDir).agents.find((agent) => agent.name === agentName);
 		assert.ok(discovered, "expected temporary agent definition to be discovered");
-		const preflight = await resolveSubagentLaunchContract({ agent: agentName, cwd: tempDir, task, turnBudget, runId: "contract-preflight" });
+		const preflight = await resolveSubagentLaunchContract({ agent: agentName, cwd: tempDir, task, turnBudget, checkpointPolicy, runId: "contract-preflight" });
 		assert.equal(preflight.ok, true);
 
+		const foregroundStore = path.join(tempDir, "foreground-checkpoint.json");
+		persistReviewCheckpoint({
+			storePath: foregroundStore,
+			identity: { runId: "contract-foreground", agent: agentName, childIndex: 0 },
+			assistantTurn: 1,
+			submission: { kind: "final", status: "complete" },
+		});
 		mockPi.onCall({ output: "foreground contract comparison" });
-		const foreground = await runSync(tempDir, [discovered], agentName, task, { runId: "contract-foreground", acceptance: false, turnBudget });
+		const foreground = await runSync(tempDir, [discovered], agentName, task, { runId: "contract-foreground", acceptance: false, turnBudget, checkpointPolicy, reviewCheckpointStorePath: foregroundStore });
 		assert.equal(foreground.exitCode, 0);
+		assert.deepEqual(foreground.reviewFindings, []);
 		assert.equal(foreground.launchContractDigest, preflight.contract.launchContractDigest);
 
 		mockPi.onCall({ output: "async contract comparison" });
 		const asyncId = `async-contract-equivalence-${Date.now().toString(36)}`;
+		persistReviewCheckpoint({
+			storePath: path.join(ASYNC_DIR, asyncId, "review-checkpoints", `${asyncId}-0.json`),
+			identity: { runId: asyncId, agent: agentName, childIndex: 0 },
+			assistantTurn: 1,
+			submission: { kind: "final", status: "complete" },
+		});
 		const launch = executeAsyncSingle(asyncId, {
 			agent: agentName,
 			task,
@@ -641,11 +658,13 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			maxSubagentDepth: 2,
 			acceptance: false,
 			turnBudget,
+			checkpointPolicy,
 		});
 		const payload = await readAsyncPayload(asyncId);
 		assert.equal(launch.details.launchContractDigest, preflight.contract.launchContractDigest);
 		assert.equal(payload.launchContractDigest, preflight.contract.launchContractDigest);
 		assert.equal(payload.results[0]?.launchContractDigest, preflight.contract.launchContractDigest);
+		assert.deepEqual((payload.results[0] as { reviewFindings?: string[] } | undefined)?.reviewFindings, foreground.reviewFindings);
 	});
 
 	it("persists the actual launch digest in async status and result metadata", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
@@ -1139,6 +1158,80 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(mockPi.callCount(), 3);
 	});
 
+	it("applies every global terminal control after a sibling has ended locally", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		for (const testCase of [
+			{ name: "stop", cause: "explicit-stop", state: "stopped" as const },
+			{ name: "interrupt", cause: "interrupt", state: "paused" as const },
+			{ name: "deadline", cause: "workflow-deadline", state: "failed" as const },
+			{ name: "turn budget", cause: "turn-budget", state: "failed" as const },
+		] as const) {
+			const id = `async-local-then-${testCase.name.replace(/\s+/g, "-")}-${Date.now().toString(36)}`;
+			const releasePath = path.join(tempDir, `${id}.release`);
+			mockPi.onCall({
+				matchArgIncludes: "Local timeout",
+				steps: [
+					{ jsonl: [events.toolStart("bash", { command: "sleep" })] },
+					{ delay: 2_000 },
+				],
+			});
+			mockPi.onCall(testCase.name === "turn budget"
+				? {
+					matchArgIncludes: "Trigger control",
+					steps: [{
+						waitForPath: releasePath,
+						jsonl: [{
+							type: "message_end",
+							message: {
+								role: "assistant",
+								content: [{ type: "text", text: "budget trigger" }],
+								model: "mock/test-model",
+								stopReason: "length",
+								usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } },
+							},
+						}],
+					}],
+				}
+				: { matchArgIncludes: "Trigger control", delay: 2_000, output: "too late" });
+			mockPi.onCall({ matchArgIncludes: "Other active child", delay: 2_000, output: "too late" });
+			executeAsyncChain(id, {
+				chain: [{
+					parallel: [
+						{ agent: "local", task: "Local timeout" },
+						{ agent: "trigger", task: "Trigger control" },
+						{ agent: "other", task: "Other active child" },
+					],
+					concurrency: 3,
+				}],
+				resultMode: "parallel",
+				agents: [makeAgent("local"), makeAgent("trigger"), makeAgent("other")],
+				ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+				artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+				shareEnabled: false,
+				maxSubagentDepth: 2,
+				callToolTimeoutMs: 50,
+				...(testCase.name === "turn budget" ? { turnBudget: { maxTurns: 1, graceTurns: 0 } } : {}),
+			});
+			const asyncDir = path.join(ASYNC_DIR, id);
+			const localFailure = await waitForAsyncState(id, (status) => status.steps?.[0]?.status === "failed" && status.steps?.[1]?.status === "running" && status.steps?.[2]?.status === "running");
+			assert.match(localFailure.steps?.[0]?.error ?? "", /Tool 'bash' exceeded its timeout/);
+			if (testCase.name === "stop") deliverStopRequest({ asyncDir, pid: localFailure.pid, source: "test" });
+			else if (testCase.name === "interrupt") deliverInterruptRequest({ asyncDir, pid: localFailure.pid, source: "test" });
+			else if (testCase.name === "deadline") deliverTimeoutRequest({ asyncDir, pid: localFailure.pid, source: "test" });
+			else fs.writeFileSync(releasePath, "release", "utf-8");
+
+			const payload = await readAsyncPayload(id);
+			const status = await waitForAsyncState(id, (candidate) => candidate.state === testCase.state);
+			assert.equal(payload.state, testCase.state, testCase.name);
+			assert.equal((payload as { terminalCause?: string }).terminalCause, testCase.cause, testCase.name);
+			const expectedActiveStatuses = testCase.state === "paused"
+				? ["paused", "paused"]
+				: testCase.state === "stopped"
+					? ["stopped", "stopped"]
+					: ["failed", "failed"];
+			assert.deepEqual(status.steps?.slice(1).map((step) => step.status), expectedActiveStatuses, testCase.name);
+		}
+	});
+
 	it("marks async parallel runs that exceed timeoutMs as timed out", { skip: !isAsyncAvailable() ? "jiti not available" : process.platform === "win32" ? "timeout signal delivery intermittent on Windows CI" : undefined }, async () => {
 		mockPi.onCall({ delay: 5_000, output: "one done" });
 		mockPi.onCall({ delay: 5_000, output: "two done" });
@@ -1246,7 +1339,9 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 
 			const payload = await readAsyncPayload(id);
 			assert.equal(payload.state, "failed");
+			assert.equal(payload.terminalCause, "tool-timeout");
 			assert.equal(payload.results[0]?.timedOut, true);
+			assert.equal(payload.results[0]?.terminalCause, "tool-timeout");
 			assert.match(payload.results[0]?.error ?? "", /Tool 'bash' exceeded its timeout of 1000ms\./);
 		} finally {
 			delete process.env.PI_SUBAGENT_TOOL_TIMEOUT_MS;
@@ -1321,7 +1416,9 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			});
 
 			const payload = await readAsyncPayload(id);
+			assert.equal(payload.terminalCause, "workflow-deadline");
 			assert.equal(payload.results[0]?.timedOut, true);
+			assert.equal(payload.results[0]?.terminalCause, "workflow-deadline");
 			assert.equal(payload.results[0]?.error, "Subagent timed out after 300ms.");
 		} finally {
 			delete process.env.PI_SUBAGENT_TOOL_TIMEOUT_MS;
@@ -1748,6 +1845,61 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(status.stopped, true);
 		assert.equal(status.turnBudgetExceeded, undefined);
 		assert.equal(status.steps?.[0]?.status, "stopped");
+	});
+
+	it("writes atomic async checkpoint artifacts for explicit stop, deadline, and no-checkpoint termination", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		for (const testCase of [
+			{ name: "explicit stop", cause: "explicit-stop", stop: true, checkpoint: true },
+			// Windows CI cannot reliably start and signal the mock child inside this
+			// 500 ms deadline; the foreground Windows path and async POSIX path cover it.
+			...(process.platform === "win32" ? [] : [{ name: "deadline", cause: "workflow-deadline", stop: false, checkpoint: true }] as const),
+			{ name: "no checkpoint", cause: "explicit-stop", stop: true, checkpoint: false },
+		] as const) {
+			const callIndex = mockPi.callCount();
+			mockPi.onCall({ delay: 10_000 });
+			const id = `async-checkpoint-${testCase.name.replace(/\s+/g, "-")}-${Date.now().toString(36)}`;
+			const artifactsDir = path.join(tempDir, id, "artifacts");
+			executeAsyncSingle(id, {
+				agent: "slow",
+				task: "Wait for terminal checkpoint collection.",
+				agentConfig: makeAgent("slow"),
+				ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+				artifactsDir,
+				artifactConfig: { enabled: true, includeInput: false, includeOutput: true, includeJsonl: false, includeMetadata: true, cleanupDays: 7 },
+				shareEnabled: false,
+				maxSubagentDepth: 2,
+				acceptance: false,
+				checkpointPolicy: { version: 1 },
+				...(testCase.stop ? {} : { timeoutMs: 500 }),
+			});
+			await waitForMockPiCall(mockPi, callIndex);
+			if (testCase.checkpoint) {
+				persistReviewCheckpoint({
+					storePath: path.join(ASYNC_DIR, id, "review-checkpoints", `${id}-0.json`),
+					identity: { runId: id, agent: "slow", childIndex: 0 },
+					assistantTurn: 1,
+					submission: {
+						kind: "finding",
+						finding: { severity: "blocker", path: "src/async-checkpoint.ts", line: 7, claim: "Acknowledged finding survives async terminal collection.", evidence: "The receipt precedes the runner stop signal." },
+					},
+				});
+			}
+			if (testCase.stop) deliverStopRequest({ asyncDir: path.join(ASYNC_DIR, id), source: "test" });
+			const payload = await readAsyncPayload(id);
+			const artifactPath = (payload.results[0] as { reviewCheckpointArtifactPath?: string; artifactPaths?: { reviewCheckpointPath?: string } } | undefined)?.reviewCheckpointArtifactPath
+				?? (payload.results[0] as { artifactPaths?: { reviewCheckpointPath?: string } } | undefined)?.artifactPaths?.reviewCheckpointPath;
+			assert.ok(artifactPath, testCase.name);
+			const text = fs.readFileSync(artifactPath, "utf-8");
+			const artifact = JSON.parse(text) as { status?: string; cause?: string; checkpointState?: string; findings?: Array<{ path?: string }> };
+			assert.equal(artifact.status, "truncated", testCase.name);
+			assert.equal(artifact.cause, testCase.cause, testCase.name);
+			assert.equal(text.split(REVIEW_CHECKPOINT_BUDGET_TRUNCATED_MARKER).length - 1, 1, testCase.name);
+			if (testCase.checkpoint) assert.equal(artifact.findings?.[0]?.path, "src/async-checkpoint.ts", testCase.name);
+			else {
+				assert.equal(artifact.checkpointState, "no-checkpoint");
+				assert.equal((payload.results[0] as { reviewFindings?: unknown[] } | undefined)?.reviewFindings, undefined, "no checkpoint must not look like a clean review");
+			}
+		}
 	});
 
 	it("async launch messages tell the parent not to sleep-poll", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
@@ -2781,6 +2933,51 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(mockPi.callCount(), 2);
 	});
 
+	it("requires a replacement async fallback attempt to provide its own final checkpoint", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const id = `async-checkpoint-fallback-${Date.now().toString(36)}`;
+		persistReviewCheckpoint({
+			storePath: path.join(ASYNC_DIR, id, "review-checkpoints", `${id}-0.json`),
+			identity: { runId: id, agent: "reviewer", childIndex: 0, attempt: 1 },
+			assistantTurn: 1,
+			submission: { kind: "final", status: "complete" },
+		});
+		mockPi.onCall({
+			jsonl: [{
+				type: "message_end",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "primary provider failed" }],
+					model: "openai/gpt-5-mini",
+					errorMessage: "rate limit exceeded",
+					usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } },
+				},
+			}],
+			exitCode: 1,
+		});
+		mockPi.onCall({ output: "fallback completed without a checkpoint" });
+		executeAsyncSingle(id, {
+			agent: "reviewer",
+			task: "Review the implementation",
+			agentConfig: makeAgent("reviewer", {
+				model: "openai/gpt-5-mini",
+				fallbackModels: ["anthropic/claude-sonnet-4"],
+			}),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			sessionRoot: path.join(tempDir, "sessions"),
+			maxSubagentDepth: 2,
+			acceptance: false,
+			checkpointPolicy: { version: 1 },
+		});
+		const payload = await readAsyncPayload(id);
+		const result = payload.results[0] as { reviewCheckpointState?: string; error?: string; modelAttempts?: Array<{ success?: boolean }> } | undefined;
+		assert.equal(payload.success, false);
+		assert.equal(result?.reviewCheckpointState, "missing");
+		assert.equal(result?.modelAttempts?.length, 2);
+		assert.match(result?.error ?? "", /Review checkpoint evidence is missing/);
+	});
+
 	it("background runs retry the fallback model when the provider stream ends without finish_reason", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		mockPi.onCall({
 			jsonl: [{
@@ -3059,6 +3256,64 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.match(statusPayload.steps?.[0]?.error ?? "", /429 quota exceeded/);
 	});
 
+	it("terminates async rate limits promptly while retaining incomplete checkpoint evidence", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const id = `async-rate-limit-${Date.now().toString(36)}`;
+		persistReviewCheckpoint({
+			storePath: path.join(ASYNC_DIR, id, "review-checkpoints", `${id}-0.json`),
+			identity: { runId: id, agent: "reviewer", childIndex: 0, attempt: 1 },
+			assistantTurn: 1,
+			submission: {
+				kind: "finding",
+				finding: { severity: "blocker", path: "src/provider.ts", line: 7, claim: "The finding survives provider termination.", evidence: "The durable receipt predates the 429 response." },
+			},
+		});
+		const providerMessage = "rate_limit: HTTP 429, retry after 172800 seconds";
+		mockPi.onCall({
+			jsonl: [{
+				type: "message_end",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "provider rejected the request" }],
+					model: "openai/gpt-5-mini",
+					stopReason: "error",
+					errorMessage: providerMessage,
+					usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } },
+				},
+			}],
+			keepAliveAfterFinalMessageMs: 10_000,
+		});
+
+		const startedAt = Date.now();
+		executeAsyncSingle(id, {
+			agent: "reviewer",
+			task: "Review the provider boundary",
+			agentConfig: makeAgent("reviewer", { model: "openai/gpt-5-mini" }),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			sessionRoot: path.join(tempDir, "sessions"),
+			maxSubagentDepth: 2,
+			acceptance: false,
+			checkpointPolicy: { version: 1 },
+		});
+		const payload = JSON.parse(fs.readFileSync(await waitForAsyncResultFile(id, 10_000), "utf-8")) as AsyncResultPayload;
+		const elapsed = Date.now() - startedAt;
+		const result = payload.results[0];
+
+		assert.ok(elapsed < 5_000, `rate limit should bypass the long provider retry, took ${elapsed}ms`);
+		assert.equal(payload.terminalCause, "rate-limit");
+		assert.equal(result?.terminalCause, "rate-limit");
+		assert.equal(result?.error, providerMessage);
+		assert.equal(result?.reviewCheckpointState, "incomplete");
+		assert.equal(result?.reviewFindings?.length, 1);
+		assert.equal(result?.acceptance?.status, "rejected");
+		assert.equal(result?.acceptance?.runtimeChecks?.find((check) => check.id === "review-checkpoint")?.status, "failed");
+		const artifact = JSON.parse(fs.readFileSync(result?.reviewCheckpointArtifactPath!, "utf-8")) as { status?: string; cause?: string; findings?: Array<{ path?: string }> };
+		assert.equal(artifact.status, "truncated");
+		assert.equal(artifact.cause, "rate-limit");
+		assert.equal(artifact.findings?.[0]?.path, "src/provider.ts");
+	});
+
 	it("background runs treat recovered child errors as successful", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		mockPi.onCall({
 			jsonl: [
@@ -3103,6 +3358,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(payload.exitCode, 0);
 		assert.equal(payload.results[0]?.success, true);
 		assert.equal(payload.results[0]?.error, undefined);
+		assert.equal(payload.results[0]?.terminalCause, "completed");
 		assert.equal(payload.results[0]?.output, "Recovered asynchronously");
 		const statusPayload = await waitForAsyncState(id, (candidate) => candidate.state === "complete");
 		assert.equal(statusPayload.state, "complete");
@@ -3152,6 +3408,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(payload.state, "failed");
 		assert.equal(payload.exitCode, 1);
 		assert.equal(payload.results[0]?.success, false);
+		assert.equal(payload.results[0]?.terminalCause, "provider-error");
 		assert.match(payload.results[0]?.error ?? "", /provider transport failed/);
 		assert.equal(payload.results[0]?.output, "");
 		const statusPayload = await waitForAsyncState(id, (candidate) => candidate.state === "failed");

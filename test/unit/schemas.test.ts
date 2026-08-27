@@ -262,6 +262,23 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 		assert.equal(toolBudgetSchema?.properties?.hard?.minimum, 1);
 	});
 
+	it("normalizes only the documented v1 checkpoint policy values", () => {
+		const checkpointPolicy = (SubagentParams?.properties as Record<string, JsonSchemaNode> | undefined)?.checkpointPolicy;
+		assert.ok(checkpointPolicy, "checkpointPolicy schema should exist");
+		const properties = checkpointPolicy.properties as Record<string, JsonSchemaNode>;
+		for (const [field, value] of Object.entries({ version: 1, requiredByTurn: 3, reserveTurns: 1, finalizeReserveMs: 120000, collectionReserveMs: 60000 })) {
+			assert.equal(properties[field]?.minimum, value, `${field} minimum`);
+			assert.equal(properties[field]?.maximum, value, `${field} maximum`);
+		}
+		assert.equal(checkpointPolicy.additionalProperties, false);
+		if (CompileSchema) {
+			const validator = CompileSchema(SubagentParams);
+			assert.equal(validator.Check({ agent: "reviewer", task: "Review", checkpointPolicy: { version: 1 } }), true);
+			assert.equal(validator.Check({ agent: "reviewer", task: "Review", checkpointPolicy: { version: 1, requiredByTurn: 4 } }), false);
+			assert.equal(validator.Check({ agent: "reviewer", task: "Review", checkpointPolicy: { version: 1, unknown: true } }), false);
+		}
+	});
+
 	it("includes root-only reported usage budget", () => {
 		const usageBudgetSchema = SubagentParams?.properties?.usageBudget;
 		assert.ok(usageBudgetSchema, "usageBudget schema should exist");

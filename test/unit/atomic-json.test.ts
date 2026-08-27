@@ -10,6 +10,14 @@ class FakeFs {
 	failMkdirCodes: string[] = [];
 	failRenameCodes: string[] = [];
 	writeOptions = new Map<string, unknown>();
+	events: string[] = [];
+	nextDescriptor = 1;
+	descriptorPaths = new Map<number, string>();
+	descriptorFlags = new Map<number, string>();
+	failReadOnlyFileFsync = false;
+	failFsyncAt: number | undefined;
+	failFsyncCodeAt: { call: number; code: string } | undefined;
+	fsyncCalls = 0;
 	failCleanup = false;
 
 	mkdirSync(dirPath: string): void {
@@ -23,11 +31,21 @@ class FakeFs {
 	}
 
 	writeFileSync(filePath: string, contents: string, options?: unknown): void {
+		this.events.push(`write:${filePath}`);
 		this.files.set(filePath, contents);
 		this.writeOptions.set(filePath, options);
 	}
 
+	readFileSync(filePath: string): string {
+		const contents = this.files.get(filePath);
+		if (contents !== undefined) return contents;
+		const error = new Error(`missing file: ${filePath}`) as NodeJS.ErrnoException;
+		error.code = "ENOENT";
+		throw error;
+	}
+
 	renameSync(sourcePath: string, targetPath: string): void {
+		this.events.push(`rename:${sourcePath}:${targetPath}`);
 		this.renameCalls++;
 		const failureCode = this.failRenameCodes.shift();
 		if (failureCode) {
@@ -39,6 +57,37 @@ class FakeFs {
 		if (contents === undefined) throw new Error(`missing source file: ${sourcePath}`);
 		this.files.delete(sourcePath);
 		this.files.set(targetPath, contents);
+	}
+
+	openSync(filePath: string, flags = "r"): number {
+		this.events.push(`open:${filePath}:${flags}`);
+		const descriptor = this.nextDescriptor++;
+		this.descriptorPaths.set(descriptor, filePath);
+		this.descriptorFlags.set(descriptor, flags);
+		return descriptor;
+	}
+
+	fsyncSync(descriptor: number): void {
+		const filePath = this.descriptorPaths.get(descriptor) ?? "unknown";
+		this.events.push(`fsync:${filePath}`);
+		this.fsyncCalls++;
+		if (this.failReadOnlyFileFsync && this.files.has(filePath) && this.descriptorFlags.get(descriptor) === "r") {
+			const error = new Error(`read-only fsync failed for ${filePath}`) as NodeJS.ErrnoException;
+			error.code = "EPERM";
+			throw error;
+		}
+		if (this.failFsyncCodeAt?.call === this.fsyncCalls) {
+			const error = new Error(`fsync failed for ${filePath}`) as NodeJS.ErrnoException;
+			error.code = this.failFsyncCodeAt.code;
+			throw error;
+		}
+		if (this.failFsyncAt === this.fsyncCalls) throw new Error(`fsync failed for ${filePath}`);
+	}
+
+	closeSync(descriptor: number): void {
+		this.events.push(`close:${this.descriptorPaths.get(descriptor) ?? "unknown"}`);
+		this.descriptorPaths.delete(descriptor);
+		this.descriptorFlags.delete(descriptor);
 	}
 
 	rmSync(filePath: string): void {
@@ -105,6 +154,74 @@ describe("writeAtomicJson", () => {
 		writeAtomicJson(targetPath, { sourceRunId: "run" });
 
 		assert.deepEqual([...fakeFs.writeOptions.values()], [{ encoding: "utf-8", mode: 0o600 }]);
+	});
+
+	it("syncs the temporary file before rename and the parent directory after it, without acknowledging any fault point", () => {
+		const targetPath = path.join("/tmp", "durable.json");
+		for (const testCase of [
+			{ name: "file sync", failFsyncAt: 1, renameCalls: 0 },
+			{ name: "rename", failRenameCodes: ["ENOSPC"], renameCalls: 1 },
+			{ name: "directory sync", failFsyncAt: 2, renameCalls: 2, preimage: JSON.stringify({ state: "previous" }, null, 2) },
+		] as const) {
+			const fakeFs = new FakeFs();
+			if (testCase.preimage) fakeFs.files.set(targetPath, testCase.preimage);
+			fakeFs.failFsyncAt = testCase.failFsyncAt;
+			fakeFs.failRenameCodes = testCase.failRenameCodes ? [...testCase.failRenameCodes] : [];
+			const writeDurableJson = createAtomicJsonWriter({
+				fs: fakeFs as any,
+				now: () => 12345,
+				pid: 678,
+				random: () => 0.5,
+				durable: true,
+			});
+
+			assert.throws(() => writeDurableJson(targetPath, { state: "running" }), /failed|ENOSPC/, testCase.name);
+			assert.equal(fakeFs.renameCalls, testCase.renameCalls, testCase.name);
+			if (testCase.name === "file sync") assert.equal(fakeFs.events.some((event) => event.startsWith("rename:")), false);
+			if (testCase.name === "rename") assert.equal(fakeFs.events.filter((event) => event.startsWith("fsync:")).length, 1);
+			if (testCase.name === "directory sync") assert.equal(fakeFs.files.get(targetPath), testCase.preimage, "post-rename directory sync failure restores the destination pre-image");
+		}
+
+		const fakeFs = new FakeFs();
+		const writeDurableJson = createAtomicJsonWriter({ fs: fakeFs as any, now: () => 12345, pid: 678, random: () => 0.5, durable: true });
+		writeDurableJson(targetPath, { state: "running" });
+		const order = fakeFs.events.filter((event) => event.startsWith("write:") || event.startsWith("fsync:") || event.startsWith("rename:"));
+		assert.equal(order[0]?.startsWith("write:"), true);
+		assert.equal(order[1]?.startsWith("fsync:"), true);
+		assert.equal(order[2]?.startsWith("rename:"), true);
+		assert.equal(order[3], `fsync:${path.dirname(targetPath)}`);
+	});
+
+	it("tolerates unsupported Windows directory fsync without hiding file fsync failures", () => {
+		const targetPath = path.join("/tmp", "durable-windows.json");
+		const directoryFailure = new FakeFs();
+		directoryFailure.failReadOnlyFileFsync = true;
+		directoryFailure.failFsyncCodeAt = { call: 2, code: "EPERM" };
+		const writeWithUnsupportedDirectorySync = createAtomicJsonWriter({
+			fs: directoryFailure as any,
+			now: () => 12345,
+			pid: 678,
+			random: () => 0.5,
+			durable: true,
+			platform: "win32",
+		});
+
+		writeWithUnsupportedDirectorySync(targetPath, { state: "running" });
+		assert.equal(directoryFailure.files.get(targetPath), JSON.stringify({ state: "running" }, null, 2));
+		assert.equal(directoryFailure.fsyncCalls, 2);
+
+		const fileFailure = new FakeFs();
+		fileFailure.failFsyncCodeAt = { call: 1, code: "EPERM" };
+		const writeWithFileSyncFailure = createAtomicJsonWriter({
+			fs: fileFailure as any,
+			now: () => 12345,
+			pid: 678,
+			random: () => 0.5,
+			durable: true,
+			platform: "win32",
+		});
+		assert.throws(() => writeWithFileSyncFailure(targetPath, { state: "running" }), /fsync failed/);
+		assert.equal(fileFailure.renameCalls, 0);
 	});
 
 	it("keeps temporary names below the component limit for long target names", () => {

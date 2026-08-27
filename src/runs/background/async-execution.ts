@@ -48,6 +48,7 @@ import {
 	type ResolvedTurnBudget,
 	type ResolvedToolBudget,
 	type RunFanoutBudgetDescriptor,
+	type ReviewCheckpointPolicyInput,
 	type ToolBudgetConfig,
 	type SubagentRunMode,
 	type SteeringRecoveryDescriptor,
@@ -72,6 +73,7 @@ import { SUBAGENT_PROCESS_TERMINAL_EVENT } from "../../shared/types.ts";
 import { assertAgentAllowedByCapabilityCeiling, decodeSubagentCapabilityCeiling, intersectSubagentCapabilityCeilings, resolveCurrentSubagentCapabilityCeiling, SUBAGENT_CAPABILITY_CEILING_ENV, type ResolvedSubagentCapabilityCeiling } from "../shared/capability-ceiling.ts";
 import { agentDefinitionDigest, launchBindingDigest } from "../../shared/launch-contract.ts";
 import { resolvePermissionRules, type PermissionConfig } from "../shared/permissions.ts";
+import { validateCheckpointPolicy } from "../shared/review-checkpoint.ts";
 
 const require = createRequire(import.meta.url);
 const piPackageRoot = resolvePiPackageRoot();
@@ -175,6 +177,7 @@ interface AsyncChainParams {
 	acceptance?: AcceptanceInput;
 	timeoutMs?: number;
 	turnBudget?: ResolvedTurnBudget;
+	checkpointPolicy?: ReviewCheckpointPolicyInput;
 	toolBudget?: ResolvedToolBudget;
 	usageBudget?: UsageBudgetConfig;
 	configToolBudget?: ResolvedToolBudget;
@@ -236,6 +239,7 @@ interface AsyncSingleParams {
 	acceptance?: AcceptanceInput;
 	timeoutMs?: number;
 	absoluteDeadlineAt?: number;
+	checkpointPolicy?: ReviewCheckpointPolicyInput;
 	/** Optional per-call hard toolTimeoutMs override (highest precedence). */
 	toolTimeoutMs?: number;
 	turnBudget?: { maxTurns: number; graceTurns?: number };
@@ -283,6 +287,8 @@ export interface AsyncRunnerStepBuildParams {
 	outputBaseDir?: string;
 	validateOutputBindings?: boolean;
 	toolBudget?: ResolvedToolBudget;
+	checkpointPolicy?: import("../../shared/types.ts").ReviewCheckpointPolicy;
+	turnBudget?: ResolvedTurnBudget;
 	configToolBudget?: ResolvedToolBudget;
 	/** Optional per-call hard toolTimeoutMs override from the subagent invocation. */
 	callToolTimeoutMs?: number;
@@ -717,6 +723,9 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 	};
 	const buildSeqStep = (s: SequentialStep, sessionFile?: string, behaviorCwd?: string, progressPrecreated = false, resolvedBehavior?: ResolvedStepBehavior, flatIndex?: number, parallelOutputNamespace?: { stepIndex: number; taskIndex?: number }, runFanoutPath?: string) => {
 		const a = agents.find((x) => x.name === s.agent)!;
+		const checkpointValidation = s.checkpointPolicy === undefined ? undefined : validateCheckpointPolicy(s.checkpointPolicy, `chain checkpointPolicy for '${s.agent}'`);
+		if (checkpointValidation?.error) throw new AsyncStartValidationError(checkpointValidation.error);
+		const checkpointPolicy = checkpointValidation?.policy ?? params.checkpointPolicy;
 		const externalRunner = a.runner?.type === "external-cli" || a.runner?.type === "external-job";
 		const externalRunnerType = a.runner?.type;
 		if (externalRunner) {
@@ -725,6 +734,7 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 			if (s.outputSchema !== undefined) unsupported.push("structured output");
 			if (s.acceptance !== undefined || params.agentContract !== undefined || s.agentContract !== undefined) unsupported.push("acceptance/agent contract");
 			if (s.toolBudget !== undefined || params.toolBudget !== undefined || a.toolBudget !== undefined || params.configToolBudget !== undefined) unsupported.push("tool budget");
+			if (checkpointPolicy) unsupported.push("review checkpoints");
 			if (params.contextForAgent?.(s.agent) === "fork") unsupported.push("fork context");
 			if (unsupported.length > 0) throw new AsyncStartValidationError(`Agent '${a.name}' uses runner.type='${externalRunnerType}' and does not support: ${unsupported.join(", ")}.`);
 		}
@@ -810,11 +820,37 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 			cwd: stepCwd,
 			requireReadTool: Boolean(resolvedSkills.length),
 			structuredOutput: Boolean(s.outputSchema),
+			checkpointPolicy,
 			capabilityCeiling: params.capabilityCeiling,
 			inheritedCapabilityCeiling: decodeSubagentCapabilityCeiling(process.env[SUBAGENT_CAPABILITY_CEILING_ENV]),
 			agentName: a.name,
 		});
 		const launchResolvedExtensions = externalRunner ? undefined : projectLaunchResolvedChildExtensions(toolPlan);
+		const modelCandidates = externalRunner ? undefined : buildModelCandidates(primaryModel, a.fallbackModels, availableModels, ctx.currentModelProvider, { scope: ctx.modelScope }).flatMap((candidate) => {
+			const resolved = applyThinkingSuffix(candidate, effectiveThinking, thinkingOverride !== undefined);
+			return resolved ? [resolved] : [];
+		});
+		const definitionDigest = agentDefinitionDigest(a);
+		const launchBindingTask = parallelOutputNamespace && parallelOutputNamespace.taskIndex === undefined ? undefined : task;
+		const launchContractDigest = externalRunner ? undefined : launchBindingDigest({
+			definitionDigest,
+			task,
+			...(model ? { model } : {}),
+			modelCandidates,
+			...(resolveEffectiveThinking(model, effectiveThinking) ? { thinking: resolveEffectiveThinking(model, effectiveThinking) } : {}),
+			systemPrompt: appendTurnBudgetSystemPrompt(systemPrompt, params.turnBudget),
+			systemPromptMode: a.systemPromptMode,
+			inheritProjectContext: a.inheritProjectContext,
+			inheritSkills: a.inheritSkills,
+			skills: resolvedSkills.map((r) => r.name),
+			tools: toolPlan.effectiveToolAllowlist,
+			extensions: toolPlan.extensionArgs,
+			mcpDirectTools: toolPlan.effectiveMcpTools,
+			...(outputPath ? { outputPath } : {}),
+			outputMode: behavior.outputMode,
+			...(checkpointPolicy ? { checkpointPolicy } : {}),
+			...(s.outputSchema ? { structuredOutputSchema: s.outputSchema } : {}),
+		});
 		const permissionRules = resolvePermissionRules(ctx.permissions, a.permissions);
 		if (externalRunner && permissionRules) {
 			throw new AsyncStartValidationError(`Agent '${a.name}' uses runner.type='${externalRunnerType}', which cannot enforce native Pi child permission rules.`);
@@ -837,9 +873,8 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 			model,
 			thinking: resolveEffectiveThinking(model, effectiveThinking),
 			launchResolvedExtensions,
-			modelCandidates: externalRunner ? undefined : buildModelCandidates(primaryModel, a.fallbackModels, availableModels, ctx.currentModelProvider, { scope: ctx.modelScope }).map((candidate) =>
-				applyThinkingSuffix(candidate, effectiveThinking, thinkingOverride !== undefined),
-			),
+			...(externalRunner ? {} : { definitionDigest, ...(launchBindingTask ? { launchBindingTask } : {}), launchContractDigest }),
+			modelCandidates,
 			tools: a.tools,
 			extensions: a.extensions,
 			subagentOnlyExtensions: a.subagentOnlyExtensions,
@@ -853,6 +888,7 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 			outputPath,
 			...(namespaceOutputPath ? { namespaceOutputPath: true } : {}),
 			outputMode: behavior.outputMode,
+			...(checkpointPolicy ? { checkpointPolicy } : {}),
 			sessionFile,
 			maxSubagentDepth: resolveChildMaxSubagentDepth(maxSubagentDepth, a.maxSubagentDepth),
 			timeoutMs: a.defaultTimeoutMs ?? DEFAULT_ASYNC_TIMEOUT_MS,
@@ -1013,6 +1049,9 @@ export function executeAsyncChain(
 	id: string,
 	params: AsyncChainParams,
 ): AsyncExecutionResult {
+	const checkpointValidation = params.checkpointPolicy === undefined ? undefined : validateCheckpointPolicy(params.checkpointPolicy);
+	if (checkpointValidation?.error) return formatAsyncStartError(params.resultMode ?? "chain", checkpointValidation.error);
+	const checkpointPolicy = checkpointValidation?.policy;
 	const {
 		chain,
 		agents,
@@ -1085,6 +1124,8 @@ export function executeAsyncChain(
 		worktreeBaseDir,
 		asyncDir,
 		toolBudget: params.toolBudget,
+		checkpointPolicy,
+		turnBudget: params.turnBudget,
 		configToolBudget: params.configToolBudget,
 		callToolTimeoutMs: params.callToolTimeoutMs,
 		configToolTimeoutMs: params.configToolTimeoutMs,
@@ -1144,6 +1185,7 @@ export function executeAsyncChain(
 				worktreeBaseDir,
 				controlConfig,
 				turnBudget: params.turnBudget,
+				checkpointPolicy,
 				toolBudget: params.toolBudget,
 				usageBudget: params.usageBudget,
 				controlIntercomTarget,
@@ -1278,6 +1320,7 @@ export function executeAsyncChain(
 			asyncDir,
 			...(sessionRoot ? { sessionRoot } : {}),
 			...(params.timeoutMs !== undefined ? { timeoutMs: params.timeoutMs, deadlineAt } : {}),
+			...(checkpointPolicy ? { checkpointPolicy } : {}),
 			...(initialTurnBudget ? { turnBudget: initialTurnBudget } : {}),
 			...(initialUsageBudget ? { usageBudget: initialUsageBudget } : {}),
 			...(capabilityCeiling ? { capabilityCeiling } : {}),
@@ -1295,7 +1338,7 @@ export function executeAsyncChain(
 
 	return {
 		content: [{ type: "text", text: formatAsyncStartedMessage(`Async ${resultMode}: ${chainDesc} [${id}]`, ctx.interactive === true) }],
-		details: { mode: resultMode, runId: id, results: [], asyncId: id, asyncDir, workflowGraph, ...(capabilityCeiling ? { capabilityCeiling } : {}), ...(params.parentWorkflowRunId ? { parentWorkflowRunId: params.parentWorkflowRunId } : {}), ...(params.workflowKey ? { workflowKey: params.workflowKey } : {}), ...(params.timeoutMs !== undefined ? { timeoutMs: params.timeoutMs, deadlineAt } : {}), ...(params.turnBudget ? { turnBudget: params.turnBudget } : {}), ...(params.toolBudget ? { toolBudget: params.toolBudget } : {}), ...(initialUsageBudget ? { usageBudget: initialUsageBudget } : {}) },
+		details: { mode: resultMode, runId: id, results: [], asyncId: id, asyncDir, workflowGraph, ...(checkpointPolicy ? { checkpointPolicy } : {}), ...(capabilityCeiling ? { capabilityCeiling } : {}), ...(params.parentWorkflowRunId ? { parentWorkflowRunId: params.parentWorkflowRunId } : {}), ...(params.workflowKey ? { workflowKey: params.workflowKey } : {}), ...(params.timeoutMs !== undefined ? { timeoutMs: params.timeoutMs, deadlineAt } : {}), ...(params.turnBudget ? { turnBudget: params.turnBudget } : {}), ...(params.toolBudget ? { toolBudget: params.toolBudget } : {}), ...(initialUsageBudget ? { usageBudget: initialUsageBudget } : {}) },
 	};
 }
 
@@ -1310,6 +1353,9 @@ export function executeAsyncSingle(
 	id: string,
 	params: AsyncSingleParams,
 ): AsyncExecutionResult {
+	const checkpointValidation = params.checkpointPolicy === undefined ? undefined : validateCheckpointPolicy(params.checkpointPolicy);
+	if (checkpointValidation?.error) return formatAsyncStartError("single", checkpointValidation.error);
+	const checkpointPolicy = checkpointValidation?.policy;
 	const {
 		agent,
 		agentConfig,
@@ -1343,6 +1389,7 @@ export function executeAsyncSingle(
 		if (params.structuredOutputSchema !== undefined) unsupported.push("structured output");
 		if (params.acceptance !== undefined || params.agentContract !== undefined) unsupported.push("acceptance/agent contract");
 		if (params.toolBudget !== undefined || agentConfig.toolBudget !== undefined || params.configToolBudget !== undefined) unsupported.push("tool budget");
+		if (params.checkpointPolicy !== undefined) unsupported.push("review checkpoints");
 		if (params.context === "fork") unsupported.push("fork context");
 		if ((params.skills?.length ?? 0) > 0) unsupported.push("skills");
 		if (permissionRules) unsupported.push("native Pi child permissions");
@@ -1460,6 +1507,7 @@ export function executeAsyncSingle(
 		cwd: runnerCwd,
 		requireReadTool: Boolean(resolvedSkills.length),
 		structuredOutput: Boolean(params.structuredOutputSchema),
+		checkpointPolicy,
 		capabilityCeiling,
 		inheritedCapabilityCeiling: decodeSubagentCapabilityCeiling(process.env[SUBAGENT_CAPABILITY_CEILING_ENV]),
 		agentName: agentConfig.name,
@@ -1481,6 +1529,7 @@ export function executeAsyncSingle(
 		mcpDirectTools: toolPlan.effectiveMcpTools,
 		...(outputPath ? { outputPath } : {}),
 		outputMode,
+		...(checkpointPolicy ? { checkpointPolicy } : {}),
 		...(params.structuredOutputSchema ? { structuredOutputSchema: params.structuredOutputSchema } : {}),
 	});
 	const resolvedAcceptance = resolveEffectiveAcceptance({
@@ -1526,6 +1575,7 @@ export function executeAsyncSingle(
 		...(controlConfig ? { controlConfig } : {}),
 		...(params.intercomBridge !== undefined ? { intercomBridge: params.intercomBridge } : {}),
 		...(deadlineAt !== undefined ? { absoluteDeadlineAt: deadlineAt } : {}),
+		...(checkpointPolicy ? { checkpointPolicy } : {}),
 		...(initialTurnBudget ? { initialTurnBudget: { maxTurns: initialTurnBudget.maxTurns, graceTurns: initialTurnBudget.graceTurns } } : {}),
 		...(resolvedToolBudget.budget ? { initialToolBudget: resolvedToolBudget.budget } : {}),
 		maxSubagentDepth: resolveChildMaxSubagentDepth(maxSubagentDepth, recoveryAgentConfig.maxSubagentDepth),
@@ -1573,6 +1623,7 @@ export function executeAsyncSingle(
 						skills: resolvedSkills.map((r) => r.name),
 						outputPath,
 						outputMode,
+						...(checkpointPolicy ? { checkpointPolicy } : {}),
 						...(!externalRunner && sessionFile ? { sessionFile } : {}),
 						maxSubagentDepth: resolveChildMaxSubagentDepth(maxSubagentDepth, agentConfig.maxSubagentDepth),
 						waitToolEnabled: params.waitToolEnabled,
@@ -1612,6 +1663,7 @@ export function executeAsyncSingle(
 				deadlineAt,
 				toolTimeoutMs,
 				turnBudget: params.turnBudget,
+				checkpointPolicy,
 				toolBudget: params.toolBudget,
 				usageBudget: params.usageBudget,
 				controlIntercomTarget,
@@ -1707,6 +1759,7 @@ export function executeAsyncSingle(
 			...(params.parentWorkflowRunId ? { parentWorkflowRunId: params.parentWorkflowRunId } : {}),
 			...(params.workflowKey ? { workflowKey: params.workflowKey } : {}),
 			...(timeoutMs !== undefined ? { timeoutMs, deadlineAt } : {}),
+			...(checkpointPolicy ? { checkpointPolicy } : {}),
 			...(initialTurnBudget ? { turnBudget: initialTurnBudget } : {}),
 			...(initialUsageBudget ? { usageBudget: initialUsageBudget } : {}),
 			...(capabilityCeiling ? { capabilityCeiling } : {}),
@@ -1716,6 +1769,6 @@ export function executeAsyncSingle(
 
 	return {
 		content: [{ type: "text", text: formatAsyncStartedMessage(`Async: ${agent} [${id}]`, ctx.interactive === true) }],
-		details: { mode: "single", runId: id, results: [], asyncId: id, asyncDir, launchContractDigest, launchResolvedExtensions, ...(capabilityCeiling ? { capabilityCeiling } : {}), ...(params.context ? { context: params.context } : {}), ...(timeoutMs !== undefined ? { timeoutMs, deadlineAt } : {}), ...(params.turnBudget ? { turnBudget: params.turnBudget } : {}), ...(params.toolBudget ? { toolBudget: resolvedToolBudget.budget ?? params.toolBudget } : {}), ...(initialUsageBudget ? { usageBudget: initialUsageBudget } : {}) } as Details,
+		details: { mode: "single", runId: id, results: [], asyncId: id, asyncDir, launchContractDigest, launchResolvedExtensions, ...(checkpointPolicy ? { checkpointPolicy } : {}), ...(capabilityCeiling ? { capabilityCeiling } : {}), ...(params.context ? { context: params.context } : {}), ...(timeoutMs !== undefined ? { timeoutMs, deadlineAt } : {}), ...(params.turnBudget ? { turnBudget: params.turnBudget } : {}), ...(params.toolBudget ? { toolBudget: resolvedToolBudget.budget ?? params.toolBudget } : {}), ...(initialUsageBudget ? { usageBudget: initialUsageBudget } : {}) } as Details,
 	};
 }

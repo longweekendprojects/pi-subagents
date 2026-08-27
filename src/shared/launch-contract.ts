@@ -91,6 +91,7 @@ export interface LaunchBindingInput {
 	mcpDirectTools?: string[];
 	outputPath?: string;
 	outputMode?: string;
+	checkpointPolicy?: import("./types.ts").ReviewCheckpointPolicy;
 	structuredOutputSchema?: unknown;
 }
 
@@ -115,6 +116,7 @@ export function projectLaunchBinding(input: LaunchBindingInput): Record<string, 
 		mcpDirectTools: input.mcpDirectTools,
 		outputPath: input.outputPath,
 		outputMode: input.outputMode,
+		checkpointPolicy: input.checkpointPolicy,
 		structuredOutputSchema: input.structuredOutputSchema,
 	};
 }

@@ -26,12 +26,14 @@ import {
 	type SingleResult,
 	type Usage,
 	DEFAULT_MAX_OUTPUT,
+	TEMP_ROOT_DIR,
 	INTERCOM_DETACH_REQUEST_EVENT,
 	INTERCOM_DETACH_RESPONSE_EVENT,
 	type AcceptanceLedger,
 	type ResolvedAcceptanceConfig,
 	truncateOutput,
 	getSubagentDepthEnv,
+	type TerminalCause,
 } from "../../shared/types.ts";
 import {
 	DEFAULT_CONTROL_CONFIG,
@@ -72,9 +74,11 @@ import { readChildToolDiagnosticError } from "../shared/tool-availability.ts";
 import { captureSingleOutputSnapshot, extractChildWrittenOutput, finalizeSingleOutput, formatSavedOutputReference, injectOutputPathSystemPrompt, resolveSingleOutput, validateFileOnlyOutputMode, type SingleOutputSnapshot } from "../shared/single-output.ts";
 import {
 	buildModelCandidates,
+	classifyAssistantProviderFailure,
 	formatModelAttemptNote,
 	isRetryableModelFailure,
 } from "../shared/model-fallback.ts";
+import { createOwnedProcessTreeController } from "../background/owned-process-tree.ts";
 import {
 	SUBAGENT_STARTUP_RETRY_DELAYS_MS,
 	formatSubagentExtensionConflictError,
@@ -98,6 +102,7 @@ import { acceptanceFailureMessage, buildSkippedAcceptanceLedger, evaluateAccepta
 import { PROMPT_REDACTED } from "../../shared/utils.ts";
 import { attachContractProjections, isAgentContractV1 } from "../shared/agent-contract.ts";
 import { appendTurnBudgetSystemPrompt, formatTurnBudgetOutput, initialTurnBudgetState, turnBudgetDecision, turnBudgetDeferredNote, turnBudgetDeferredState, turnBudgetExceededMessage, turnBudgetSoftNote, turnBudgetState } from "../shared/turn-budget.ts";
+import { checkpointAttemptStorePath, checkpointMachineArtifactPath, checkpointStorePath, projectCheckpointEvidence, salvageReviewCheckpoints, validateCheckpointPolicy, writeReviewCheckpointMachineArtifact } from "../shared/review-checkpoint.ts";
 import { initialToolBudgetState, toolBudgetState } from "../shared/tool-budget.ts";
 import { resolveWatchdogConfig } from "../../watchdog/settings.ts";
 import { agentDefinitionDigest, launchBindingDigest } from "../../shared/launch-contract.ts";
@@ -154,6 +159,13 @@ function persistSingleResultMetadata(input: {
 		task: PROMPT_REDACTED,
 		exitCode: target.exitCode,
 		processSignal: target.processSignal,
+		terminalCause: target.terminalCause,
+		checkpointPolicy: target.checkpointPolicy,
+		reviewCheckpoints: target.reviewCheckpoints,
+		reviewCheckpointState: target.reviewCheckpointState,
+		reviewFindings: target.reviewFindings,
+		reviewCheckpointArtifactPath: target.reviewCheckpointArtifactPath,
+		residualRisks: target.residualRisks,
 		usage: target.usage,
 		model: target.model,
 		attemptedModels: target.attemptedModels,
@@ -309,6 +321,9 @@ async function runSingleAttempt(
 		orcaProgressTab?: OrcaProgressTab;
 	},
 ): Promise<SingleResult> {
+	const checkpointPolicy = options.checkpointPolicy === undefined
+		? undefined
+		: validateCheckpointPolicy(options.checkpointPolicy).policy;
 	const effectiveThinking = options.thinkingOverride ?? agent.thinking;
 	const modelArg = applyThinkingSuffix(model, effectiveThinking, options.thinkingOverride !== undefined);
 	const resolvedThinking = resolveEffectiveThinking(modelArg, effectiveThinking);
@@ -360,6 +375,12 @@ async function runSingleAttempt(
 		steerCapabilityPath: options.steerCapabilityPath,
 		steerAckDir: options.steerAckDir,
 		structuredOutput: options.structuredOutput,
+		checkpointPolicy,
+		reviewCheckpointStorePath: options.reviewCheckpointStorePath,
+		checkpointAttempt: options.reviewCheckpointAttempt,
+		checkpointFinalizeAt: checkpointPolicy && options.timeoutMs !== undefined
+			? (options.deadlineAt ?? Date.now() + options.timeoutMs) - checkpointPolicy.finalizeReserveMs
+			: undefined,
 		toolBudget: options.toolBudget,
 		allowZeroToolBudget: options.allowZeroToolBudget,
 		permissionRules,
@@ -378,6 +399,7 @@ async function runSingleAttempt(
 		cwd: options.cwd ?? runtimeCwd,
 		requireReadTool: Boolean(shared.resolvedSkillNames?.length),
 		structuredOutput: Boolean(options.structuredOutput),
+		checkpointPolicy,
 		capabilityCeiling: options.capabilityCeiling,
 		inheritedCapabilityCeiling: decodeSubagentCapabilityCeiling(process.env[SUBAGENT_CAPABILITY_CEILING_ENV]),
 		agentName: agent.name,
@@ -399,6 +421,7 @@ async function runSingleAttempt(
 		mcpDirectTools: toolPlan.effectiveMcpTools,
 		...(options.outputPath ? { outputPath: options.outputPath } : {}),
 		outputMode: options.outputMode ?? "inline",
+		...(checkpointPolicy ? { checkpointPolicy } : {}),
 		...(options.structuredOutput ? { structuredOutputSchema: options.structuredOutput.schema } : {}),
 	});
 	const result: SingleResult = withRunContext({
@@ -419,10 +442,16 @@ async function runSingleAttempt(
 		skills: shared.resolvedSkillNames,
 		skillsWarning: shared.skillsWarning,
 		...(options.turnBudget ? { turnBudget: initialTurnBudgetState(options.turnBudget) } : {}),
+		...(checkpointPolicy ? { checkpointPolicy } : {}),
 		...(options.toolBudget ? { toolBudget: initialToolBudgetState(options.toolBudget) } : {}),
 		...(options.capabilityCeiling ? { capabilityCeiling: options.capabilityCeiling } : {}),
 		...(capabilityAudit ? { capabilityAudit } : {}),
 	}, options.context);
+	const claimTerminalCause = (cause: TerminalCause): boolean => {
+		if (result.terminalCause !== undefined) return false;
+		result.terminalCause = cause;
+		return true;
+	};
 	const startTime = Date.now();
 	if (options.structuredOutput) {
 		try {
@@ -467,6 +496,7 @@ async function runSingleAttempt(
 		cleanupTempDir(tempDir);
 		result.exitCode = 1;
 		result.timedOut = true;
+		claimTerminalCause("workflow-deadline");
 		result.error = attemptTimeout.message;
 		result.finalOutput = attemptTimeout.message;
 		progress.status = "failed";
@@ -490,19 +520,26 @@ async function runSingleAttempt(
 			env: spawnEnv,
 			stdio: ["ignore", "pipe", "pipe"],
 			windowsHide: true,
+			detached: process.platform !== "win32",
 		});
+		const processTreeController = typeof proc.pid === "number"
+			? createOwnedProcessTreeController(proc.pid)
+			: undefined;
 		const jsonlWriter = createJsonlWriter(shared.jsonlPath, proc.stdout);
 		let processClosed = false;
 		let lifecycleFinished = false;
 		let detached = false;
 		let intercomStarted = false;
 		let assistantError: string | undefined;
+		let pendingProviderFailure: ReturnType<typeof classifyAssistantProviderFailure>;
 		let removeAbortListener: (() => void) | undefined;
 		let removeInterruptListener: (() => void) | undefined;
 		let activityTimer: NodeJS.Timeout | undefined;
 		let timeoutTimer: NodeJS.Timeout | undefined;
 		let timeoutTerminationTimer: NodeJS.Timeout | undefined;
 		let timeoutHardKillTimer: NodeJS.Timeout | undefined;
+		let abortHardKillTimer: NodeJS.Timeout | undefined;
+		let rateLimitHardKillTimer: NodeJS.Timeout | undefined;
 		let turnBudgetSoftReached = false;
 		let turnBudgetTerminationTimer: NodeJS.Timeout | undefined;
 		let turnBudgetHardKillTimer: NodeJS.Timeout | undefined;
@@ -677,6 +714,14 @@ async function runSingleAttempt(
 			clearTimeoutTimers();
 			clearAllToolTimeouts();
 			clearTurnBudgetTimers();
+			if (abortHardKillTimer) {
+				clearTimeout(abortHardKillTimer);
+				abortHardKillTimer = undefined;
+			}
+			if (rateLimitHardKillTimer) {
+				clearTimeout(rateLimitHardKillTimer);
+				rateLimitHardKillTimer = undefined;
+			}
 			if (protocolHardKillTimer) {
 				clearTimeout(protocolHardKillTimer);
 				protocolHardKillTimer = undefined;
@@ -817,6 +862,7 @@ async function runSingleAttempt(
 		const requestTurnBudgetAbort = (turnCount: number) => {
 			const budget = options.turnBudget;
 			if (!budget || result.timedOut || result.turnBudgetExceeded || interruptedByControl || processClosed || lifecycleFinished) return;
+			if (!claimTerminalCause("turn-budget")) return;
 			const message = turnBudgetExceededMessage(budget, turnCount);
 			result.turnBudgetExceeded = true;
 			result.wrapUpRequested = true;
@@ -925,9 +971,9 @@ async function runSingleAttempt(
 		const processLine = (line: string) => {
 			if (!line.trim()) return;
 			jsonlWriter.writeLine(line);
-			let evt: { type?: string; message?: Message; toolName?: string; toolCallId?: string; args?: unknown; willRetry?: unknown };
+			let evt: { type?: string; message?: Message; toolName?: string; toolCallId?: string; args?: unknown; details?: unknown; willRetry?: unknown };
 			try {
-				evt = JSON.parse(line) as { type?: string; message?: Message; toolName?: string; toolCallId?: string; args?: unknown; willRetry?: unknown };
+				evt = JSON.parse(line) as { type?: string; message?: Message; toolName?: string; toolCallId?: string; args?: unknown; details?: unknown; willRetry?: unknown };
 			} catch {
 				rawStdoutTail.push(`${line}\n`);
 				shared.transcriptWriter?.writeStdoutLine(line);
@@ -1034,12 +1080,23 @@ async function runSingleAttempt(
 						progress.model = evt.message.model;
 						if (!result.model) result.model = evt.message.model;
 					}
-					if (evt.message.errorMessage) assistantError = evt.message.errorMessage;
+					const providerFailure = classifyAssistantProviderFailure(stopReason, evt.message.errorMessage);
+					if (providerFailure?.terminalCause === "rate-limit") {
+						terminateForRateLimit(providerFailure.error);
+					} else if (providerFailure && result.terminalCause === undefined) {
+						pendingProviderFailure = providerFailure;
+						assistantError = providerFailure.error;
+					} else if (evt.message.errorMessage && result.terminalCause === undefined) {
+						assistantError = evt.message.errorMessage;
+					}
 					const assistantText = extractTextFromContent(evt.message.content);
 					appendRecentOutput(progress, assistantText.split("\n").slice(-10));
 					// Final assistant message: start the exit drain window.
 					if (terminalAssistantStop) {
-						if (!evt.message.errorMessage && assistantText.trim()) assistantError = undefined;
+						if (!evt.message.errorMessage && assistantText.trim() && result.terminalCause === undefined) {
+							assistantError = undefined;
+							pendingProviderFailure = undefined;
+						}
 						cleanTerminalAssistantStopReceived ||= !evt.message.errorMessage;
 						applyChildLifecycle(projectChildLifecycle(evt, true));
 					}
@@ -1096,7 +1153,7 @@ async function runSingleAttempt(
 
 		if (attemptTimeout) {
 			timeoutTimer = setTimeout(() => {
-				if (processClosed || lifecycleFinished || interruptedByControl) return;
+				if (processClosed || lifecycleFinished || interruptedByControl || !claimTerminalCause("workflow-deadline")) return;
 				result.timedOut = true;
 				clearAllToolTimeouts();
 				result.error = attemptTimeout.message;
@@ -1156,7 +1213,7 @@ async function runSingleAttempt(
 			}
 		};
 		const terminateForToolTimeout = (message: string): void => {
-			if (processClosed || lifecycleFinished || interruptedByControl) return;
+			if (processClosed || lifecycleFinished || interruptedByControl || !claimTerminalCause("tool-timeout")) return;
 			result.timedOut = true;
 			result.error = message;
 			result.finalOutput = message;
@@ -1194,10 +1251,32 @@ async function runSingleAttempt(
 			keys.push(key);
 			activeToolTimeoutKeysByName.set(toolName, keys);
 		};
+		const terminateForRateLimit = (message: string): boolean => {
+			if (processClosed || lifecycleFinished || interruptedByControl || !claimTerminalCause("rate-limit")) return false;
+			assistantError = message;
+			result.error = message;
+			result.finalOutput = message;
+			progress.status = "failed";
+			progress.error = message;
+			progress.durationMs = Date.now() - startTime;
+			clearTimeoutTimers();
+			clearAllToolTimeouts();
+			fireUpdate();
+			if (process.platform !== "win32" && processTreeController) {
+				void processTreeController.terminate();
+			} else {
+				trySignalChild(proc, "SIGTERM");
+				rateLimitHardKillTimer = setTimeout(() => {
+					if (!processClosed && !childExited) trySignalChild(proc, "SIGKILL");
+				}, 3000);
+				rateLimitHardKillTimer.unref?.();
+			}
+			return true;
+		};
 
 		const stderrTail = createBoundedByteTail();
 		const failProtocol = (limit: ProtocolOutputLimit): void => {
-			if (result.protocolError) return;
+			if (result.protocolError || !claimTerminalCause("protocol-failure")) return;
 			result.protocolError = limit;
 			result.error = formatProtocolOutputLimit(limit);
 			progress.status = "failed";
@@ -1271,10 +1350,16 @@ async function runSingleAttempt(
 			}
 			const finalCode = forcedDrainAfterFinalSuccess ? 0 : forcedTerminationSignal || signal ? (code ?? 1) : (code ?? 0);
 			if (!result.error && closeError) result.error = closeError;
+			claimTerminalCause(signal
+				? "process-signal"
+				: pendingProviderFailure?.terminalCause === "provider-error"
+					? "provider-error"
+					: finalCode === 0 && !result.error ? "completed" : "process-failure");
 			finish(finalCode);
 		});
 		proc.on("error", (error) => {
 			if (lifecycleFinished) return;
+			claimTerminalCause("spawn-failure");
 			processClosed = true;
 			clearFinalDrainTimers();
 			clearStdioGuard();
@@ -1292,9 +1377,12 @@ async function runSingleAttempt(
 
 		if (options.signal) {
 			const kill = () => {
-				if (processClosed || lifecycleFinished) return;
+				if (processClosed || lifecycleFinished || !claimTerminalCause("explicit-stop")) return;
 				proc.kill("SIGTERM");
-				setTimeout(() => !proc.killed && proc.kill("SIGKILL"), 3000);
+				abortHardKillTimer = setTimeout(() => {
+					if (!processClosed && !childExited) trySignalChild(proc, "SIGKILL");
+				}, 3000);
+				abortHardKillTimer.unref?.();
 			};
 			if (options.signal.aborted) kill();
 			else {
@@ -1305,8 +1393,7 @@ async function runSingleAttempt(
 
 		if (options.interruptSignal) {
 			const interrupt = () => {
-				if (processClosed || lifecycleFinished) return;
-				if (result.timedOut) return;
+				if (processClosed || lifecycleFinished || result.timedOut || !claimTerminalCause("interrupt")) return;
 				interruptedByControl = true;
 				clearTimeoutTimers();
 				clearAllToolTimeouts();
@@ -1340,6 +1427,7 @@ async function runSingleAttempt(
 		}
 	});
 	result.exitCode = exitCode;
+	if (result.exitCode === 0 && !result.error) claimTerminalCause("completed");
 	if (interruptedByControl) {
 		result.exitCode = 0;
 		result.interrupted = true;
@@ -1543,8 +1631,22 @@ async function runSyncCompletionInner(
 	task: string,
 	options: RunSyncOptions,
 ): Promise<SingleResult> {
+	const checkpointValidation = options.checkpointPolicy === undefined ? undefined : validateCheckpointPolicy(options.checkpointPolicy);
+	if (checkpointValidation?.error) {
+		return redactResultPrompt(withRunContext({
+			index: options.index ?? 0,
+			agent: agentName,
+			task,
+			exitCode: 1,
+			messages: [],
+			usage: emptyUsage(),
+			error: checkpointValidation.error,
+		}, options.context));
+	}
+	const checkpointPolicy = checkpointValidation?.policy;
 	options = {
 		...options,
+		...(checkpointPolicy ? { checkpointPolicy } : {}),
 		capabilityCeiling: intersectSubagentCapabilityCeilings(options.capabilityCeiling ?? resolveCurrentSubagentCapabilityCeiling(options.parentSessionId), decodeSubagentCapabilityCeiling(process.env[SUBAGENT_CAPABILITY_CEILING_ENV])),
 	};
 	const agent = agents.find((a) => a.name === agentName);
@@ -1632,6 +1734,13 @@ async function runSyncCompletionInner(
 	const acceptancePrompt = formatAcceptancePrompt(effectiveAcceptance, { reportOptional: isAgentContractV1(options.agentContract) });
 	const taskWithAcceptance = acceptancePrompt ? `${task}\n${acceptancePrompt}` : task;
 	options.onEffectivePrompt?.(taskWithAcceptance);
+	const reviewCheckpointStoreBasePath = checkpointPolicy
+		? options.reviewCheckpointStorePath ?? checkpointStorePath(
+			options.artifactsDir ?? path.join(TEMP_ROOT_DIR, "foreground"),
+			options.runId,
+			options.index ?? 0,
+		)
+		: undefined;
 	const sessionEnabled = Boolean(options.sessionFile || options.sessionDir) || shareEnabled;
 	if (options.context === "fork" && options.sessionFile && existsSync(options.sessionFile)) {
 		alignForkedSessionCwd(options.sessionFile, options.cwd ?? runtimeCwd);
@@ -1746,6 +1855,9 @@ async function runSyncCompletionInner(
 		},
 	};
 	let lastResult: SingleResult | undefined;
+	let checkpointAttempt = 0;
+	let finalCheckpointAttempt = 1;
+	let finalCheckpointStorePath = reviewCheckpointStoreBasePath;
 	const modelsToTry = candidates.length > 0 ? candidates : [undefined];
 	// Escalated to "file" after an unexplained zero-activity startup failure so
 	// retries keep the task text out of argv (endpoint pre-exec scans may deny it).
@@ -1754,7 +1866,15 @@ async function runSyncCompletionInner(
 		const candidate = modelsToTry[modelIndex];
 		for (let startupAttemptIndex = 0; ; startupAttemptIndex++) {
 			const outputSnapshot = captureSingleOutputSnapshot(options.outputPath);
-			const result = await runSingleAttempt(runtimeCwd, agent, taskWithAcceptance, candidate, attemptOptions, {
+			const currentCheckpointAttempt = checkpointPolicy ? ++checkpointAttempt : undefined;
+			const currentCheckpointStorePath = currentCheckpointAttempt && reviewCheckpointStoreBasePath
+				? checkpointAttemptStorePath(reviewCheckpointStoreBasePath, currentCheckpointAttempt)
+				: undefined;
+			const result = await runSingleAttempt(runtimeCwd, agent, taskWithAcceptance, candidate, {
+				...attemptOptions,
+				...(currentCheckpointStorePath ? { reviewCheckpointStorePath: currentCheckpointStorePath } : {}),
+				...(currentCheckpointAttempt ? { reviewCheckpointAttempt: currentCheckpointAttempt } : {}),
+			}, {
 				sessionEnabled,
 				systemPrompt,
 				resolvedSkillNames: resolvedSkills.length > 0 ? resolvedSkills.map((skill) => skill.name) : undefined,
@@ -1772,6 +1892,10 @@ async function runSyncCompletionInner(
 				orcaProgressTab,
 			});
 			lastResult = result;
+			if (currentCheckpointAttempt) {
+				finalCheckpointAttempt = currentCheckpointAttempt;
+				finalCheckpointStorePath = currentCheckpointStorePath;
+			}
 			if (startupAttemptIndex === 0) {
 				if (result.model) attemptedModels.push(result.model);
 				else if (candidate) attemptedModels.push(candidate);
@@ -1886,6 +2010,29 @@ async function runSyncCompletionInner(
 	};
 	if (transcriptWriter) result.transcriptPath = artifactPathsResult?.transcriptPath;
 	if (transcriptWriter?.getError()) result.transcriptError = transcriptWriter.getError();
+	if (checkpointPolicy) {
+		const checkpoints = salvageReviewCheckpoints({
+			storePath: finalCheckpointStorePath,
+			transcriptPath: result.transcriptPath,
+			identity: { runId: options.runId, childIndex: options.index ?? 0, agent: agentName, attempt: finalCheckpointAttempt },
+		});
+		const evidence = projectCheckpointEvidence(checkpoints);
+		result.reviewCheckpointState = evidence.state;
+		if (checkpoints.length > 0) {
+			result.reviewCheckpoints = checkpoints;
+			result.reviewFindings = evidence.findings;
+		}
+		const terminalCause = result.terminalCause ?? (result.exitCode === 0 && !result.error ? "completed" : "process-failure");
+		const machineArtifactPath = artifactPathsResult?.reviewCheckpointPath
+			?? checkpointMachineArtifactPath(options.artifactsDir ?? path.join(TEMP_ROOT_DIR, "foreground"), options.runId, options.index ?? 0);
+		try {
+			writeReviewCheckpointMachineArtifact({ artifactPath: machineArtifactPath, records: checkpoints, terminalCause });
+			result.reviewCheckpointArtifactPath = machineArtifactPath;
+		} catch (error) {
+			const message = `Review checkpoint artifact finalization failed: ${error instanceof Error ? error.message : String(error)}`;
+			result.metadataSaveError = result.metadataSaveError ? `${result.metadataSaveError}\n${message}` : message;
+		}
+	}
 
 	try {
 		if (artifactPathsResult && options.artifactConfig?.enabled !== false) {
@@ -1944,6 +2091,9 @@ async function runSyncCompletionInner(
 					: undefined,
 				cwd: options.cwd ?? runtimeCwd,
 				reportOptional: isAgentContractV1(options.agentContract),
+				...(checkpointPolicy && result.reviewCheckpoints?.length ? { checkpointEvidence: projectCheckpointEvidence(result.reviewCheckpoints) } : {}),
+				...(checkpointPolicy ? { checkpointTerminalCause: result.terminalCause ?? (result.exitCode === 0 && !result.error ? "completed" : "process-failure") } : {}),
+				requireCheckpoint: Boolean(checkpointPolicy),
 				artifactsDir: options.artifactsDir,
 				runId: options.runId,
 			});
@@ -1953,8 +2103,9 @@ async function runSyncCompletionInner(
 		result.acceptance = buildSkippedAcceptanceLedger(effectiveAcceptance, { id: "acceptance-evaluation", message });
 	}
 	const acceptanceFailure = acceptanceFailureMessage(result.acceptance);
+	const checkpointFailure = Boolean(checkpointPolicy && result.acceptance.runtimeChecks.some((check) => check.id === "review-checkpoint" && check.status === "failed"));
 	stripAcceptanceReportsFromMessages(result.messages);
-	if (acceptanceFailure && result.acceptance.explicit && result.exitCode === 0 && !result.interrupted && !result.timedOut && !isAgentContractV1(options.agentContract)) {
+	if (acceptanceFailure && (result.acceptance.explicit || checkpointFailure) && result.exitCode === 0 && !result.interrupted && !result.timedOut && (!isAgentContractV1(options.agentContract) || checkpointFailure)) {
 		result.exitCode = 1;
 		if (result.savedOutputPath) {
 			result.finalOutput = finalizeSingleOutput({

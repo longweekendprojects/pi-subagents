@@ -6,9 +6,22 @@ import { registerNativeSupervisorClient } from "../../intercom/native-supervisor
 import { shouldUseNativeFsWatch } from "../../shared/watch-strategy.ts";
 import { decodePermissionRules, permissionDecision, PERMISSION_AUDIT_PATH_ENV, PERMISSION_POLICY_ENV } from "./permissions.ts";
 import { consumeSteerRequestsFromDir, MAX_STEER_QUEUE_SIZE, steerAckPathFromDir, writeSteerAckAt, writeSteerCapabilityAt, writeSteerRequestToDir, type SteerDeliveryStatus, type SteerRequest } from "../background/control-channel.ts";
-import { SUBAGENT_CHILD_AGENT_ENV, SUBAGENT_CHILD_INDEX_ENV, SUBAGENT_FANOUT_CHILD_ENV, SUBAGENT_STEER_ACK_DIR_ENV, SUBAGENT_STEER_CAPABILITY_ENV, SUBAGENT_STEER_INBOX_ENV } from "./pi-args.ts";
+import { SUBAGENT_CHILD_AGENT_ENV, SUBAGENT_CHILD_INDEX_ENV, SUBAGENT_FANOUT_CHILD_ENV, SUBAGENT_RUN_ID_ENV, SUBAGENT_STEER_ACK_DIR_ENV, SUBAGENT_STEER_CAPABILITY_ENV, SUBAGENT_STEER_INBOX_ENV } from "./pi-args.ts";
 import { RUNTIME_EXTENSION_ACK_EVENT, RUNTIME_EXTENSION_ACK_PATH_ENV, isRuntimeAcknowledgedExtensionId, writeRuntimeAcknowledgedExtensions } from "./runtime-acknowledged-extensions.ts";
 import { createStructuredOutputToolParameters, STRUCTURED_OUTPUT_CAPTURE_ENV, STRUCTURED_OUTPUT_SCHEMA_ENV, validateStructuredOutputValue } from "./structured-output.ts";
+import {
+	REVIEW_CHECKPOINT_ATTEMPT_ENV,
+	REVIEW_CHECKPOINT_FINALIZE_AT_ENV,
+	REVIEW_CHECKPOINT_PARAMETERS_SCHEMA,
+	REVIEW_CHECKPOINT_POLICY_ENV,
+	REVIEW_CHECKPOINT_STORE_ENV,
+	REVIEW_CHECKPOINT_TOOL_NAME,
+	persistReviewCheckpoint,
+	persistReviewCheckpointGateState,
+	readReviewCheckpointStoreState,
+	validateCheckpointPolicy,
+	validateReviewCheckpointSubmission,
+} from "./review-checkpoint.ts";
 import {
 	CHILD_TOOL_DIAGNOSTIC_PATH_ENV,
 	MCP_DIRECT_CHILD_TOOLS_ENV,
@@ -38,6 +51,12 @@ const STRUCTURED_OUTPUT_INSTRUCTIONS = [
 	"This subagent step has a strict structured output contract.",
 	"Your final action must be to call the `structured_output` tool with JSON matching the provided schema.",
 	"Do not rely on prose-only completion; if you do not call `structured_output`, the parent will fail this step.",
+].join("\n");
+
+const REVIEW_CHECKPOINT_INSTRUCTIONS = [
+	"This subagent step requires durable, incremental review checkpoints before assistant turn 3.",
+	"Call `review_checkpoint` once for each complete structured finding, use progress/no-confirmed-finding-yet only when no finding is confirmed, and finish with final/complete or final/truncated plus its typed cause.",
+	"A finding needs severity, path, one line or a bounded line range, claim, and evidence. A checkpoint is acknowledged only after durable persistence. Do not rely on prose or a tool start as evidence.",
 ].join("\n");
 
 export const CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS = [
@@ -189,7 +208,8 @@ export function rewriteSubagentPrompt(
 	rewritten = stripChildBoundaryInstructions(rewritten);
 	const boundary = options.fanoutChild ? CHILD_FANOUT_BOUNDARY_INSTRUCTIONS : CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS;
 	const structured = process.env[STRUCTURED_OUTPUT_CAPTURE_ENV] ? `\n\n${STRUCTURED_OUTPUT_INSTRUCTIONS}` : "";
-	return `${boundary}${structured}\n\n${rewritten}`;
+	const checkpoint = process.env[REVIEW_CHECKPOINT_POLICY_ENV] ? `\n\n${REVIEW_CHECKPOINT_INSTRUCTIONS}` : "";
+	return `${boundary}${structured}${checkpoint}\n\n${rewritten}`;
 }
 
 function isParentOnlySubagentMessage(message: unknown): boolean {
@@ -306,6 +326,294 @@ export function registerPermissionGate(
 		});
 		if (result.approved) return undefined;
 		return { block: true, reason: `Blocked by pi-subagents permission rule: ${result.reason}` };
+	});
+}
+
+function registerReviewCheckpoint(pi: ExtensionAPI): void {
+	const rawPolicy = process.env[REVIEW_CHECKPOINT_POLICY_ENV]?.trim();
+	if (!rawPolicy) return;
+	let policy: ReturnType<typeof validateCheckpointPolicy>["policy"];
+	try {
+		policy = validateCheckpointPolicy(JSON.parse(rawPolicy)).policy;
+	} catch {
+		policy = undefined;
+	}
+	const storePath = process.env[REVIEW_CHECKPOINT_STORE_ENV]?.trim();
+	const runId = process.env[SUBAGENT_RUN_ID_ENV]?.trim();
+	const agent = process.env[SUBAGENT_CHILD_AGENT_ENV]?.trim();
+	const childIndex = Number(process.env[SUBAGENT_CHILD_INDEX_ENV]);
+	const rawFinalizeAt = Number(process.env[REVIEW_CHECKPOINT_FINALIZE_AT_ENV]);
+	const finalizeAt = Number.isFinite(rawFinalizeAt) && rawFinalizeAt > 0 ? rawFinalizeAt : undefined;
+	const rawAttempt = process.env[REVIEW_CHECKPOINT_ATTEMPT_ENV];
+	const attempt = rawAttempt === undefined ? 1 : Number(rawAttempt);
+	if (!policy || !storePath || !runId || !agent || !Number.isInteger(childIndex) || childIndex < 0 || !Number.isInteger(attempt) || attempt < 1) {
+		throw new Error("Invalid review checkpoint runtime configuration.");
+	}
+	const identity = { runId, agent, childIndex, attempt };
+	const recovered = readReviewCheckpointStoreState(storePath, identity);
+	let assistantTurn = recovered.assistantTurn;
+	let checkpointCompleted = recovered.checkpointSatisfied;
+	let permanentFinalization = recovered.permanentFinalization;
+	let durableFinalCheckpoint = recovered.records.some((record) => record.submission.kind === "final");
+	let finalizationAbortDelivered = recovered.finalizationAbortDelivered === true;
+	let finalizationSteerDelivered = recovered.finalizationSteerDelivered === true;
+	let gateStatePersistenceError: string | undefined;
+	let finalizationAbortError: string | undefined;
+	let finalizationSteerError: string | undefined;
+	let investigativeCallAdmittedThisTurn = false;
+	let checkpointBoundaryThisTurn = false;
+	let pendingFinalizationThisTurn = false;
+	let activeLifecycle = false;
+	let activeContext: ExtensionContext | undefined;
+	let finalizationTimer: ReturnType<typeof setTimeout> | undefined;
+	let sessionShutdown = false;
+	const FINALIZATION_RETRY_MS = 250;
+	const structuredOutputActive = Boolean(process.env[STRUCTURED_OUTPUT_CAPTURE_ENV]);
+	const sendUserMessage = (pi as { sendUserMessage?: (content: string, options: { deliverAs: "steer" }) => unknown }).sendUserMessage;
+	const onRuntimeEvent = pi.on as unknown as (event: string, handler: (event: { toolName?: unknown; input?: unknown }, ctx?: ExtensionContext) => unknown) => void;
+	const finalizationIsDue = (): boolean => assistantTurn >= policy.requiredByTurn + policy.reserveTurns
+		|| (finalizeAt !== undefined && Date.now() >= finalizeAt);
+	const persistGateState = (update: {
+		permanentFinalization?: boolean;
+		finalizationAbortDelivered?: boolean;
+		finalizationSteerDelivered?: boolean;
+	} = {}): boolean => {
+		try {
+			const state = persistReviewCheckpointGateState({
+				storePath,
+				identity,
+				assistantTurn,
+				checkpointSatisfied: checkpointCompleted,
+				permanentFinalization: permanentFinalization || update.permanentFinalization === true,
+				finalizationAbortDelivered: finalizationAbortDelivered || update.finalizationAbortDelivered === true,
+				finalizationSteerDelivered: finalizationSteerDelivered || update.finalizationSteerDelivered === true,
+			});
+			assistantTurn = state.assistantTurn;
+			checkpointCompleted = state.checkpointSatisfied;
+			permanentFinalization = state.permanentFinalization;
+			finalizationAbortDelivered = state.finalizationAbortDelivered === true;
+			finalizationSteerDelivered = state.finalizationSteerDelivered === true;
+			gateStatePersistenceError = undefined;
+			return true;
+		} catch (error) {
+			const message = `Review checkpoint gate state persistence failed: ${error instanceof Error ? error.message : String(error)}`;
+			if (gateStatePersistenceError !== message) console.error(message);
+			gateStatePersistenceError = message;
+			return false;
+		}
+	};
+	const currentGateError = (): string | undefined => gateStatePersistenceError ?? finalizationAbortError ?? finalizationSteerError;
+	const reportFinalizationError = (operation: "abort" | "steering", error: unknown): string => {
+		const message = `Review checkpoint finalization ${operation} failed: ${error instanceof Error ? error.message : String(error)}`;
+		console.error(message);
+		return message;
+	};
+	const clearFinalizationTimer = (): void => {
+		if (!finalizationTimer) return;
+		clearTimeout(finalizationTimer);
+		finalizationTimer = undefined;
+	};
+	const absoluteFinalizationIsDue = (): boolean => finalizeAt !== undefined && Date.now() >= finalizeAt;
+	const finalizationDeliveryComplete = (): boolean => finalizationAbortDelivered && finalizationSteerDelivered;
+	const finalizeActiveTurn = (): boolean => {
+		if (durableFinalCheckpoint) return true;
+		if (!permanentFinalization) {
+			if (!absoluteFinalizationIsDue()) return false;
+			if (!persistGateState({ permanentFinalization: true })) return false;
+		}
+		if (!finalizationAbortDelivered) {
+			if (!activeContext) {
+				finalizationAbortError = reportFinalizationError("abort", "active extension context is unavailable");
+			} else {
+				try {
+					activeContext.abort();
+					finalizationAbortDelivered = true;
+					finalizationAbortError = undefined;
+					persistGateState({ finalizationAbortDelivered: true });
+				} catch (error) {
+					finalizationAbortError = reportFinalizationError("abort", error);
+				}
+			}
+		}
+		if (!finalizationSteerDelivered) {
+			if (!sendUserMessage) {
+				finalizationSteerError = reportFinalizationError("steering", "sendUserMessage is unavailable");
+			} else {
+				try {
+					sendUserMessage(
+						"Review checkpoint finalization is required now. Immediately checkpoint every confirmed finding, submit the final status, and return your final response. Do not investigate further.",
+						{ deliverAs: "steer" },
+					);
+					finalizationSteerDelivered = true;
+					finalizationSteerError = undefined;
+					persistGateState({ finalizationSteerDelivered: true });
+				} catch (error) {
+					finalizationSteerError = reportFinalizationError("steering", error);
+				}
+			}
+		}
+		if (finalizationDeliveryComplete() && gateStatePersistenceError) {
+			persistGateState({
+				permanentFinalization: true,
+				finalizationAbortDelivered: true,
+				finalizationSteerDelivered: true,
+			});
+		}
+		return finalizationDeliveryComplete() && !gateStatePersistenceError;
+	};
+	const armFinalizationTimer = (ctx?: ExtensionContext): void => {
+		if (ctx) activeContext = ctx;
+		clearFinalizationTimer();
+		if (!finalizeAt || !activeLifecycle || sessionShutdown || durableFinalCheckpoint || (finalizationDeliveryComplete() && !gateStatePersistenceError)) return;
+		const delay = absoluteFinalizationIsDue() ? FINALIZATION_RETRY_MS : Math.max(0, finalizeAt - Date.now());
+		finalizationTimer = setTimeout(() => {
+			finalizationTimer = undefined;
+			if (!finalizeActiveTurn()) armFinalizationTimer();
+		}, delay);
+		finalizationTimer.unref?.();
+	};
+	const beginFinalizationIfDue = (): boolean => permanentFinalization || finalizationIsDue();
+	const allowsFinalizationTool = (toolName: string): boolean => toolName === REVIEW_CHECKPOINT_TOOL_NAME || (toolName === "structured_output" && structuredOutputActive);
+	const checkpointToolValue = (input: unknown): unknown => input && typeof input === "object" && !Array.isArray(input) && Object.hasOwn(input, "value")
+		? (input as { value: unknown }).value
+		: input;
+	const finalCheckpointInput = (input: unknown): boolean => {
+		const value = checkpointToolValue(input);
+		return Boolean(value) && typeof value === "object" && !Array.isArray(value) && (value as { kind?: unknown }).kind === "final";
+	};
+	onRuntimeEvent("agent_start", (_event, ctx) => {
+		activeLifecycle = true;
+		if (ctx) activeContext = ctx;
+		if (absoluteFinalizationIsDue()) {
+			if (!finalizeActiveTurn()) armFinalizationTimer(ctx);
+		} else {
+			armFinalizationTimer(ctx);
+		}
+		return undefined;
+	});
+	onRuntimeEvent("turn_start", (_event, ctx) => {
+		activeLifecycle = true;
+		if (ctx) activeContext = ctx;
+		assistantTurn += 1;
+		investigativeCallAdmittedThisTurn = false;
+		checkpointBoundaryThisTurn = false;
+		pendingFinalizationThisTurn = false;
+		persistGateState();
+		if (absoluteFinalizationIsDue()) {
+			if (!finalizeActiveTurn()) armFinalizationTimer(ctx);
+		} else {
+			armFinalizationTimer(ctx);
+		}
+		return undefined;
+	});
+	onRuntimeEvent("agent_end", () => {
+		activeLifecycle = false;
+		activeContext = undefined;
+		clearFinalizationTimer();
+		return undefined;
+	});
+	onRuntimeEvent("session_shutdown", () => {
+		sessionShutdown = true;
+		activeLifecycle = false;
+		activeContext = undefined;
+		clearFinalizationTimer();
+		return undefined;
+	});
+	onRuntimeEvent("tool_call", (event, ctx) => {
+		if (ctx) activeContext = ctx;
+		if (absoluteFinalizationIsDue() && !finalizeActiveTurn()) armFinalizationTimer(ctx);
+		const toolName = typeof event.toolName === "string" ? event.toolName : "tool";
+		const checkpointFinal = toolName === REVIEW_CHECKPOINT_TOOL_NAME && finalCheckpointInput(event.input);
+		if (toolName === REVIEW_CHECKPOINT_TOOL_NAME) {
+			if (checkpointFinal && investigativeCallAdmittedThisTurn) {
+				return { block: true, reason: `Review checkpoint finalization must precede investigative tools in assistant turn ${assistantTurn}.` };
+			}
+			if (pendingFinalizationThisTurn && !checkpointFinal) {
+				return { block: true, reason: `Review checkpoint finalization is pending in assistant turn ${assistantTurn}; retry the final checkpoint instead.` };
+			}
+			checkpointBoundaryThisTurn = true;
+			if (checkpointFinal) pendingFinalizationThisTurn = true;
+			return undefined;
+		}
+		const gateError = currentGateError();
+		if (gateError && !allowsFinalizationTool(toolName)) {
+			return { block: true, reason: `${gateError} Only finalization tools may retry durable recovery.` };
+		}
+		if (!allowsFinalizationTool(toolName)) {
+			if (beginFinalizationIfDue() || pendingFinalizationThisTurn) {
+				return {
+					block: true,
+					reason: `Review checkpoint finalization is permanent at assistant turn ${assistantTurn}. Only '${REVIEW_CHECKPOINT_TOOL_NAME}'${structuredOutputActive ? " and 'structured_output'" : ""} may run.`,
+				};
+			}
+			if (checkpointBoundaryThisTurn) {
+				return { block: true, reason: `Review checkpoint activity cannot reopen investigation during assistant turn ${assistantTurn}.` };
+			}
+			if (assistantTurn >= policy.requiredByTurn && !checkpointCompleted) {
+				return {
+					block: true,
+					reason: `Review checkpoint gate is active at assistant turn ${assistantTurn}. Only '${REVIEW_CHECKPOINT_TOOL_NAME}'${structuredOutputActive ? " and 'structured_output'" : ""} may run until a checkpoint persists.`,
+				};
+			}
+			investigativeCallAdmittedThisTurn = true;
+		}
+		return undefined;
+	});
+	if (typeof pi.registerTool !== "function") return;
+	const registerTool = pi.registerTool as unknown as (tool: {
+		name: string;
+		label: string;
+		description: string;
+		parameters: unknown;
+		execute: (_id: string, params: { value: unknown }) => Promise<unknown>;
+	}) => void;
+	registerTool({
+		name: REVIEW_CHECKPOINT_TOOL_NAME,
+		label: "Review Checkpoint",
+		description: "Persist one structured finding, explicit progress, or a final complete/truncated status. This is acknowledged only after durable persistence.",
+		parameters: createStructuredOutputToolParameters(REVIEW_CHECKPOINT_PARAMETERS_SCHEMA) as never,
+		async execute(_id: string, params: { value: unknown }) {
+			const declaredFinal = finalCheckpointInput({ value: params.value });
+			const clearFailedFinalization = (): void => {
+				if (declaredFinal && !permanentFinalization) pendingFinalizationThisTurn = false;
+			};
+			const schemaValidation = await validateStructuredOutputValue(REVIEW_CHECKPOINT_PARAMETERS_SCHEMA, params.value);
+			if (schemaValidation.status === "invalid") {
+				clearFailedFinalization();
+				throw new Error(`Review checkpoint validation failed: ${schemaValidation.message}`);
+			}
+			const submission = validateReviewCheckpointSubmission(params.value);
+			if (!submission.submission) {
+				clearFailedFinalization();
+				throw new Error(submission.error ?? "Review checkpoint validation failed.");
+			}
+			let record;
+			try {
+				record = persistReviewCheckpoint({
+					storePath,
+					identity,
+					assistantTurn: Math.max(1, assistantTurn),
+					submission: submission.submission,
+				});
+			} catch (error) {
+				clearFailedFinalization();
+				throw new Error(`Review checkpoint persistence failed: ${error instanceof Error ? error.message : String(error)}`);
+			}
+			checkpointCompleted = true;
+			gateStatePersistenceError = undefined;
+			// The receipt and its durable gate state permanently close investigation.
+			if (submission.submission.kind === "final") {
+				permanentFinalization = true;
+				durableFinalCheckpoint = true;
+				finalizationAbortError = undefined;
+				finalizationSteerError = undefined;
+				clearFinalizationTimer();
+			}
+			return {
+				content: [{ type: "text", text: "Review checkpoint persisted." }],
+				details: { reviewCheckpoint: record },
+			};
+		},
 	});
 }
 
@@ -566,6 +874,7 @@ export function registerSteeringInbox(
 export default function registerSubagentPromptRuntime(pi: ExtensionAPI): void {
 	registerRuntimeExtensionAcknowledgements(pi);
 	registerSteeringInbox(pi);
+	registerReviewCheckpoint(pi);
 	registerPermissionGate(pi);
 	registerToolBudget(pi, decodeToolBudgetEnv(process.env[TOOL_BUDGET_ENV], { allowZero: process.env[TOOL_BUDGET_ZERO_AUTH_ENV] === "1" }));
 	registerChildWatchdog(pi);

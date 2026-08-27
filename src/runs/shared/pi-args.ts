@@ -19,10 +19,18 @@ import {
 	STRUCTURED_OUTPUT_SCHEMA_ENV,
 } from "./structured-output.ts";
 import {
+	REVIEW_CHECKPOINT_ATTEMPT_ENV,
+	REVIEW_CHECKPOINT_FINALIZE_AT_ENV,
+	REVIEW_CHECKPOINT_POLICY_ENV,
+	REVIEW_CHECKPOINT_STORE_ENV,
+	validateCheckpointPolicy,
+} from "./review-checkpoint.ts";
+import {
 	TEMP_ROOT_DIR,
 	type JsonSchemaObject,
 	type LaunchResolvedChildExtensionsV1,
 	type ResolvedToolBudget,
+	type ReviewCheckpointPolicy,
 	type RunFanoutBudgetDescriptor,
 } from "../../shared/types.ts";
 import { THINKING_LEVELS } from "../../shared/model-info.ts";
@@ -173,6 +181,12 @@ export interface BuildPiArgsInput {
 		schemaPath: string;
 		outputPath: string;
 	};
+	checkpointPolicy?: ReviewCheckpointPolicy;
+	reviewCheckpointStorePath?: string;
+	/** Writer-attempt discriminator for durable checkpoint records. */
+	checkpointAttempt?: number;
+	/** Absolute time when the child must remain in permanent checkpoint finalization. */
+	checkpointFinalizeAt?: number;
 	toolBudget?: ResolvedToolBudget;
 	allowZeroToolBudget?: boolean;
 	permissionRules?: PermissionRules;
@@ -248,6 +262,7 @@ export interface ResolvePiLaunchToolPlanInput {
 				schemaPath: string;
 				outputPath: string;
 		  };
+	checkpointPolicy?: ReviewCheckpointPolicy;
 	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
 	inheritedCapabilityCeiling?: ResolvedSubagentCapabilityCeiling;
 	agentName?: string;
@@ -425,7 +440,10 @@ export function resolvePiLaunchToolPlan(
 		input.tools !== undefined ||
 		(input.mcpDirectTools?.length ?? 0) > 0 ||
 		allowedToolSet !== undefined;
-	const internalTools = input.structuredOutput ? ["structured_output"] : [];
+	const internalTools = [
+		...(input.structuredOutput ? ["structured_output"] : []),
+		...(input.checkpointPolicy ? ["review_checkpoint"] : []),
+	];
 	const effectiveToolAllowlist = [
 		...new Set([
 			...declaredBuiltinTools,
@@ -582,6 +600,7 @@ export function buildPiArgs(input: BuildPiArgsInput): BuildPiArgsResult {
 		cwd: input.cwd,
 		requireReadTool: input.requireReadTool,
 		structuredOutput: input.structuredOutput,
+		checkpointPolicy: input.checkpointPolicy,
 		capabilityCeiling: input.capabilityCeiling,
 		inheritedCapabilityCeiling: decodeSubagentCapabilityCeiling(
 			process.env[SUBAGENT_CAPABILITY_CEILING_ENV],
@@ -809,6 +828,20 @@ export function buildPiArgs(input: BuildPiArgsInput): BuildPiArgsResult {
 	if (input.structuredOutput) {
 		env[STRUCTURED_OUTPUT_CAPTURE_ENV] = input.structuredOutput.outputPath;
 		env[STRUCTURED_OUTPUT_SCHEMA_ENV] = input.structuredOutput.schemaPath;
+	}
+	if (input.checkpointPolicy) {
+		const policy = validateCheckpointPolicy(input.checkpointPolicy);
+		if (!policy.policy) throw new Error(policy.error ?? "checkpointPolicy is invalid.");
+		if (!input.reviewCheckpointStorePath?.trim()) throw new Error("checkpointPolicy requires a durable review checkpoint store path.");
+		if (input.checkpointAttempt !== undefined && (!Number.isInteger(input.checkpointAttempt) || input.checkpointAttempt < 1)) {
+			throw new Error("checkpointPolicy requires a positive checkpoint attempt discriminator.");
+		}
+		env[REVIEW_CHECKPOINT_POLICY_ENV] = JSON.stringify(policy.policy);
+		env[REVIEW_CHECKPOINT_STORE_ENV] = input.reviewCheckpointStorePath;
+		if (input.checkpointAttempt !== undefined) env[REVIEW_CHECKPOINT_ATTEMPT_ENV] = String(input.checkpointAttempt);
+		if (input.checkpointFinalizeAt !== undefined && Number.isFinite(input.checkpointFinalizeAt)) {
+			env[REVIEW_CHECKPOINT_FINALIZE_AT_ENV] = String(input.checkpointFinalizeAt);
+		}
 	}
 	if (input.steerInboxDir) {
 		env[SUBAGENT_STEER_INBOX_ENV] = input.steerInboxDir;

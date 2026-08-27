@@ -12,6 +12,7 @@ const PROJECT_ARTIFACT_PATHS = [
 	`${PROJECT_SUBAGENTS_RELATIVE_DIR}/artifacts/run_worker.jsonl`,
 	`${PROJECT_SUBAGENTS_RELATIVE_DIR}/artifacts/run_worker_transcript.jsonl`,
 	`${PROJECT_SUBAGENTS_RELATIVE_DIR}/artifacts/run_worker_meta.json`,
+	`${PROJECT_SUBAGENTS_RELATIVE_DIR}/artifacts/run_worker_review-checkpoint.json`,
 	`${PROJECT_SUBAGENTS_RELATIVE_DIR}/artifacts/progress/run/progress.md`,
 	`${PROJECT_SUBAGENTS_RELATIVE_DIR}/artifacts/outputs/output.md`,
 	`${PROJECT_SUBAGENTS_RELATIVE_DIR}/artifacts/outputs/run/output.md`,
@@ -189,6 +190,7 @@ export function getArtifactPaths(artifactsDir: string, runId: string, agent: str
 		jsonlPath: path.join(artifactsDir, `${base}.jsonl`),
 		transcriptPath: path.join(artifactsDir, `${base}_transcript.jsonl`),
 		metadataPath: path.join(artifactsDir, `${base}_meta.json`),
+		reviewCheckpointPath: path.join(artifactsDir, `${base}_review-checkpoint.json`),
 	};
 }
 

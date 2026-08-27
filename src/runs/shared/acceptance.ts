@@ -23,6 +23,7 @@ import type {
 	SubagentRunMode,
 } from "../../shared/types.ts";
 import { isAgentContractV1 } from "./agent-contract.ts";
+import { formatReviewCheckpointFinding } from "./review-checkpoint.ts";
 import { classifyTaskMutationIntent, stripSeverityCompounds, taskMayMutate } from "./task-intent.ts";
 
 const LEVEL_RANK: Record<Exclude<AcceptanceLevel, "auto">, number> = {
@@ -1013,6 +1014,7 @@ export function aggregateAcceptanceReport(input: {
 	const childReports = input.results.map((result) => result.acceptance?.childReport).filter((report): report is AcceptanceReport => Boolean(report));
 	const blockers = input.results.filter((result) => result.exitCode !== 0 || result.acceptance?.status === "rejected");
 	const successfulChildren = input.results.length > 0 && blockers.length === 0;
+	const checkpointReviewEvidence = childReports.filter((report) => report.reviewFindings !== undefined);
 	return {
 		criteriaSatisfied: [
 			{ id: "criterion-1", status: successfulChildren ? "satisfied" : "not-satisfied", evidence: successfulChildren ? `All ${input.results.length} dynamic child run(s) completed without child or acceptance blockers.` : "Dynamic fanout produced no accepted child evidence." },
@@ -1032,7 +1034,7 @@ export function aggregateAcceptanceReport(input: {
 			...blockers.map((result) => `${result.agent}: ${result.error ?? "child or acceptance gate failed"}`),
 		]),
 		noStagedFiles: childReports.length > 0 && childReports.every((report) => report.noStagedFiles === true),
-		reviewFindings: uniqueStrings(childReports.flatMap((report) => report.reviewFindings ?? [])),
+		...(checkpointReviewEvidence.length > 0 ? { reviewFindings: uniqueStrings(checkpointReviewEvidence.flatMap((report) => report.reviewFindings!)) } : {}),
 		manualNotes: input.notes ?? `Aggregated acceptance evidence from ${input.results.length} dynamic fanout child run(s).`,
 		notes: input.notes,
 	};
@@ -1232,6 +1234,11 @@ export async function evaluateAcceptance(input: {
 	signal?: AbortSignal;
 	abortMessage?: string;
 	reportOptional?: boolean;
+	/** Runtime-validated checkpoint evidence. It is the only review-findings source when required. */
+	checkpointEvidence?: import("../../shared/types.ts").ReviewCheckpointEvidence;
+	/** Child terminal cause supplied by the runner, never inferred from output. */
+	checkpointTerminalCause?: import("../../shared/types.ts").TerminalCause;
+	requireCheckpoint?: boolean;
 	artifactsDir?: string;
 	runId?: string;
 }): Promise<AcceptanceLedger> {
@@ -1247,6 +1254,17 @@ export async function evaluateAcceptance(input: {
 		runtimeChecks: [],
 		verifyRuns: [],
 	};
+	if (input.requireCheckpoint && (!input.checkpointEvidence || input.checkpointEvidence.state !== "complete" || input.checkpointTerminalCause !== "completed")) {
+		const message = !input.checkpointEvidence
+			? "A validated final complete review checkpoint is required but none was recovered."
+			: input.checkpointEvidence.state !== "complete"
+				? `Review checkpoint evidence is ${input.checkpointEvidence.state}, not final complete.`
+				: `Review checkpoint came from terminal cause '${input.checkpointTerminalCause ?? "unknown"}', not normal completion.`;
+		ledger.runtimeChecks.push({ id: "review-checkpoint", status: "failed", message });
+		ledger.status = "rejected";
+		ledger.evidenceStatus = "rejected";
+		return ledger;
+	}
 	if (acceptance.level === "none") return ledger;
 
 	const parsed = input.report
@@ -1259,6 +1277,9 @@ export async function evaluateAcceptance(input: {
 		: parseAcceptanceReportSources(input.output, input.fileOutput);
 	const needsReport = acceptanceRequiresChildReport(acceptance);
 	if (parsed.report) {
+		if (input.requireCheckpoint && input.checkpointEvidence) {
+			parsed.report.reviewFindings = input.checkpointEvidence.findings.map(formatReviewCheckpointFinding);
+		}
 		ledger.childReport = parsed.report;
 		ledger.status = "attested";
 		ledger.evidenceStatus = "attested";

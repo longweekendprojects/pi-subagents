@@ -4,21 +4,22 @@ export function isAgentContractV1(contract: AgentContract | undefined): boolean 
 	return contract?.version === 1;
 }
 
-export function buildExecutionProjection(result: Pick<SingleResult, "exitCode" | "error" | "interrupted" | "timedOut" | "stopped" | "detached">): ExecutionProjection {
+export function buildExecutionProjection(result: Pick<SingleResult, "exitCode" | "error" | "interrupted" | "timedOut" | "stopped" | "detached" | "terminalCause">): ExecutionProjection {
 	if (result.detached) {
-		return { status: "detached", success: false, exitCode: result.exitCode, detached: true, ...(result.error ? { error: result.error } : {}) };
+		return { status: "detached", success: false, exitCode: result.exitCode, ...(result.terminalCause ? { terminalCause: result.terminalCause } : {}), detached: true, ...(result.error ? { error: result.error } : {}) };
 	}
 	if (result.stopped) {
-		return { status: "stopped", success: false, exitCode: result.exitCode, stopped: true, ...(result.error ? { error: result.error } : {}) };
+		return { status: "stopped", success: false, exitCode: result.exitCode, ...(result.terminalCause ? { terminalCause: result.terminalCause } : {}), stopped: true, ...(result.error ? { error: result.error } : {}) };
 	}
 	if (result.interrupted) {
-		return { status: "paused", success: true, exitCode: result.exitCode, interrupted: true, ...(result.error ? { error: result.error } : {}) };
+		return { status: "paused", success: true, exitCode: result.exitCode, ...(result.terminalCause ? { terminalCause: result.terminalCause } : {}), interrupted: true, ...(result.error ? { error: result.error } : {}) };
 	}
 	const success = result.exitCode === 0 && !result.error && !result.timedOut;
 	return {
 		status: success ? "completed" : "failed",
 		success,
 		exitCode: result.exitCode,
+		...(result.terminalCause ? { terminalCause: result.terminalCause } : {}),
 		...(result.error ? { error: result.error } : {}),
 		...(result.timedOut ? { timedOut: true } : {}),
 	};

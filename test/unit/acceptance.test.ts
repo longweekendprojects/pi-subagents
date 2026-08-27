@@ -635,6 +635,60 @@ describe("acceptance gates", () => {
 		}
 	});
 
+	it("requires a final checkpoint even when acceptance evidence is disabled", async () => {
+		const acceptance = resolveEffectiveAcceptance({ agentName: "reviewer", task: "Review-only. Do not edit.", explicit: false });
+		const missing = await evaluateAcceptance({
+			acceptance,
+			output: "no report",
+			cwd: process.cwd(),
+			requireCheckpoint: true,
+			checkpointTerminalCause: "completed",
+		});
+		assert.equal(missing.status, "rejected");
+		assert.match(acceptanceFailureMessage(missing) ?? "", /final complete review checkpoint is required/);
+
+		const complete = await evaluateAcceptance({
+			acceptance,
+			output: "no report",
+			cwd: process.cwd(),
+			requireCheckpoint: true,
+			checkpointEvidence: { state: "complete", findings: [], records: [] },
+			checkpointTerminalCause: "completed",
+		});
+		assert.equal(complete.status, "not-required");
+	});
+
+	it("accepts checkpoint-required review evidence only after final complete normal completion", async () => {
+		const cwd = tempRepo();
+		try {
+			const acceptance = resolveEffectiveAcceptance({
+				agentName: "reviewer",
+				task: "Review-only. Do not edit.",
+				explicit: { level: "checked", evidence: ["review-findings"] },
+			});
+			for (const testCase of [
+				{ name: "missing", evidence: undefined, cause: undefined, status: "rejected" },
+				{ name: "partial", evidence: { state: "incomplete", findings: [], records: [] } as const, cause: "completed" as const, status: "rejected" },
+				{ name: "truncated", evidence: { state: "truncated", findings: [], records: [], finalCause: "workflow-deadline" } as const, cause: "completed" as const, status: "rejected" },
+				{ name: "interrupted", evidence: { state: "complete", findings: [], records: [] } as const, cause: "interrupt" as const, status: "rejected" },
+				{ name: "normal final complete", evidence: { state: "complete", findings: [], records: [] } as const, cause: "completed" as const, status: "checked" },
+			] as const) {
+				const ledger = await evaluateAcceptance({
+					acceptance,
+					output: report({ reviewFindings: ["prose must not become evidence"] }),
+					cwd,
+					requireCheckpoint: true,
+					checkpointEvidence: testCase.evidence,
+					checkpointTerminalCause: testCase.cause,
+				});
+				assert.equal(ledger.status, testCase.status, testCase.name);
+				if (testCase.status === "checked") assert.deepEqual(ledger.childReport?.reviewFindings, []);
+			}
+		} finally {
+			fs.rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
 	it("surfaces parse validation details in acceptance failure messages", async () => {
 		const cwd = tempRepo();
 		try {
